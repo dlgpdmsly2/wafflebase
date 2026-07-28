@@ -157,30 +157,52 @@ function gitC(repoSource, args, opts = {}) {
   return execFileSync("git", ["-C", repoSource, ...args], { encoding: "utf8", maxBuffer: 256 * 1024 * 1024, ...opts });
 }
 
-/** Fetch a PR's commits into the local clone so we can diff/archive at any of
- * them (refs/pull/N/head brings the head + all PR commits). Best-effort. */
-function ensurePrCommits(repoSource, repo, n) {
+/** Fetch a PR's commits (into refs/eval/pr/N) AND its base branch (into
+ * refs/eval/base/N) so we can compute the fork point locally. refs/pull/N/head
+ * brings the head + all PR commits; the base branch gives us a merge-base anchor
+ * that survives the base TIP (baseRefOid) drifting/vanishing after merge.
+ * Best-effort per ref: returns which of {head, base} are now available. */
+function ensurePrCommits(repoSource, repo, n, baseRefName) {
+  const url = `https://github.com/${repo}.git`;
+  let base = false;
+  if (baseRefName) {
+    try {
+      gitC(repoSource, ["fetch", "-q", "-f", url, `refs/heads/${baseRefName}:refs/eval/base/${n}`], { stdio: "pipe" });
+      base = true;
+    } catch { /* base branch is optional — diff falls back without it */ }
+  }
   try {
-    gitC(repoSource, ["fetch", "-q", `https://github.com/${repo}.git`, `refs/pull/${n}/head`], { stdio: "pipe" });
-    return true;
+    gitC(repoSource, ["fetch", "-q", "-f", url, `refs/pull/${n}/head:refs/eval/pr/${n}`], { stdio: "pipe" });
+    return { head: true, base };
   } catch (e) {
     console.error(`  (fetch pull/${n}/head failed: ${e.message.split("\n")[0]})`);
-    return false;
+    return { head: false, base };
   }
 }
 
-/** The diff to review, taken AT review_commit. Three-dot (merge-base) semantics
- * to match GitHub's PR diff. Falls back to the single review commit's own change
- * if the base isn't locally reachable. */
-function diffAtReviewPoint(repoSource, repo, n, reviewPoint) {
+/** The diff to review, taken AT review_commit — the PR's cumulative change up to
+ * that commit, matching GitHub's three-dot PR diff. We diff from the FORK POINT
+ * (merge-base of the base branch and review_commit), reachable from the fetched
+ * head, so it survives the base TIP being absent/drifted post-merge AND captures
+ * every commit up to review_commit (not just the last one). stderr is captured so
+ * a fallback doesn't spew git's raw `fatal:` lines. Layered fallbacks keep a flaky
+ * PR from aborting; the last resort (single commit) is logged as a degradation. */
+function diffAtReviewPoint(repoSource, repo, n, reviewPoint, hasBase) {
   const { review_commit, review_base, review_point } = reviewPoint;
   // "head" == the merged/current PR diff — gh gives it robustly, no local commits needed.
   if (review_point === "head") return gh(["pr", "diff", n, "-R", repo, "--patch"]);
-  try {
-    return gitC(repoSource, ["diff", `${review_base}...${review_commit}`]);
-  } catch {
-    return gitC(repoSource, ["diff", `${review_commit}^...${review_commit}`]); // base unreachable → first commit alone
+  const quiet = { stdio: ["ignore", "pipe", "pipe"] };
+  if (hasBase) {
+    try {
+      const fork = gitC(repoSource, ["merge-base", `refs/eval/base/${n}`, review_commit], quiet).trim();
+      if (fork) return gitC(repoSource, ["diff", `${fork}..${review_commit}`], quiet);
+    } catch { /* merge-base unresolvable (shallow/old fork) → fall through */ }
   }
+  try {
+    return gitC(repoSource, ["diff", `${review_base}...${review_commit}`], quiet); // base tip present locally
+  } catch { /* base tip absent → last resort */ }
+  console.error(`  (PR #${n}: base history unavailable — diff limited to review_commit's own change)`);
+  return gitC(repoSource, ["diff", `${review_commit}^...${review_commit}`], quiet);
 }
 
 function resolvePrNumbers(args) {
@@ -210,10 +232,11 @@ function fetchPr(repo, n, { reviewPointMode = "auto", repoSource } = {}) {
     "number,title,author,createdAt,mergedAt,baseRefName,baseRefOid,headRefOid,files,additions,deletions,commits,closingIssuesReferences",
   ]);
   const reviewPoint = resolveReviewPoint(view, reviewPointMode);
-  // Fetch the PR's commits so review_commit (head OR first) is locally available
-  // for BOTH the review-point diff and the runner's repo-context checkout (a).
-  ensurePrCommits(repoSource, repo, n);
-  const diff = diffAtReviewPoint(repoSource, repo, n, reviewPoint);
+  // Fetch the PR's commits + base branch so review_commit (head OR first) is locally
+  // available for the review-point diff AND the runner's repo-context checkout (a),
+  // and so the fork point can be computed for a faithful three-dot diff.
+  const { base } = ensurePrCommits(repoSource, repo, n, view.baseRefName);
+  const diff = diffAtReviewPoint(repoSource, repo, n, reviewPoint, base);
   const issueSpec = fetchIssueSpec(repo, view);
   return { view, diff, issueSpec, reviewPoint };
 }
