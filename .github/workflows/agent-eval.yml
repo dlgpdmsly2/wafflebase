@@ -8,6 +8,15 @@
 # (when push_results is on) AND (b) uploaded as a downloadable artifact (always, a
 # backup that survives even if the push is misconfigured).
 #
+# Two modes (pick with the `mode` input; a dispatch runs exactly one):
+#   reliability  — whole-panel: K replicate panel runs → verdict flip-rate + κ.
+#   stage-pilot  — Mode A: capture ONE item once, then replay each STAGE
+#                  (gate/verifier/detection) K times → per-stage flip-rate/κ/overlap.
+#                  Verifier fidelity needs repo context (it Greps the tree); if the
+#                  PR commits aren't fetchable in the fork CI it falls back to
+#                  diff-only, which makes the verifier metric low-fidelity — see the
+#                  no_repo_context note.
+#
 # One-time setup — two repo secrets on THIS repo (the wafflebase fork, where the
 # workflow runs):
 #   CLAUDE_CODE_OAUTH_TOKEN  from `claude setup-token` (or an sk-ant-api03 API key)
@@ -20,6 +29,9 @@ name: agent-eval
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "reliability (whole-panel) | stage-pilot (Mode A stage isolation)"
+        default: "reliability"
       corpus_version:
         description: "corpus version (rebuilt fresh from the PRs below)"
         default: "2026-07-28-pilot"
@@ -32,6 +44,12 @@ on:
       config_id:
         description: "judge config id (label only)"
         default: "baseline-opus5-s2"
+      stage_pr:
+        description: "stage-pilot only: PR number to capture ONE item from (pick one that raises a blocking finding, e.g. 521)"
+        default: "521"
+      stage_k:
+        description: "stage-pilot only: K stage replicates per stage (≥2 for flip-rate/κ)"
+        default: "2"
       no_repo_context:
         description: "true = diff-only replay (skip repo checkout)"
         default: "false"
@@ -41,6 +59,7 @@ on:
 
 jobs:
   eval:
+    if: ${{ inputs.mode != 'stage-pilot' }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
@@ -127,5 +146,117 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: eval-${{ inputs.corpus_version }}-K${{ inputs.runs }}
+          path: ${{ env.RESULTS_DIR }}
+          retention-days: 30
+
+  # Mode A — stage-isolated reliability. Capture ONE item once (a real panel run),
+  # harvest its frozen per-stage fixtures (offline), then replay each stage K times
+  # and score per-stage flip-rate/κ (gate/verifier) and overlap (detection). Only
+  # the capture is panel-scale; the gate replay is free, verifier replays are cheap.
+  stage-pilot:
+    if: ${{ inputs.mode == 'stage-pilot' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      RESULTS_DIR: ${{ github.workspace }}/eval-results
+      # Explicit fixture-corpus name, passed to every stage step so nothing is parsed.
+      SV: ${{ inputs.corpus_version }}__stagepilot
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout eval results repo
+        if: ${{ inputs.push_results != 'false' }}
+        uses: actions/checkout@v4
+        with:
+          repository: dlgpdmsly2/wafflebase-agent-eval
+          token: ${{ secrets.EVAL_REPO_TOKEN }}
+          path: eval-results
+          fetch-depth: 0
+
+      - name: Ensure results dir exists
+        run: mkdir -p "$RESULTS_DIR"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install agent-scripts deps (SDK)
+        working-directory: scripts/agent
+        run: npm ci
+
+      - name: Extract corpus for the pilot item (fetches PR commits → repo context)
+        working-directory: scripts/agent
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node eval/extract-corpus.mjs --out "$RESULTS_DIR" \
+            --corpus-version "${{ inputs.corpus_version }}" --prs "${{ inputs.stage_pr }}"
+
+      - name: Capture — one panel run emits per-stage detail
+        working-directory: scripts/agent
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          [ "${{ inputs.no_repo_context }}" = "true" ] && FLAG="--no-repo-context" || FLAG=""
+          node eval/run.mjs --out "$RESULTS_DIR" \
+            --corpus-version "${{ inputs.corpus_version }}" \
+            --config-id "${{ inputs.config_id }}" \
+            --items "pr-${{ inputs.stage_pr }}" --run-id stage-capture $FLAG
+
+      - name: Harvest stage fixtures (offline, no model calls)
+        working-directory: scripts/agent
+        run: |
+          node eval/extract-stage-fixtures.mjs --out "$RESULTS_DIR" \
+            --run-id stage-capture --stage-version "$SV"
+
+      - name: Replay each stage K times
+        working-directory: scripts/agent
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          # Verifier/detection re-establish facts from the repo checked out at the
+          # review commit; gate is pure and ignores --repo-source. Diff-only starves
+          # the verifier's Grep (low-fidelity), so keep repo context on when you can.
+          [ "${{ inputs.no_repo_context }}" = "true" ] && REPO="" || REPO="--repo-source ${{ github.workspace }}"
+          for k in $(seq 1 "${{ inputs.stage_k }}"); do
+            for stage in gate verifier detection; do
+              echo "::group::stage=$stage k=$k"
+              node eval/stage-run.mjs --out "$RESULTS_DIR" --stage-version "$SV" \
+                --stage "$stage" --run-id "${stage}-${k}" $REPO
+              echo "::endgroup::"
+            done
+          done
+
+      - name: Score per-stage reliability
+        working-directory: scripts/agent
+        run: |
+          for stage in gate verifier detection; do
+            echo "::group::score $stage"
+            node eval/stage-reliability.mjs --out "$RESULTS_DIR" --stage-version "$SV" --stage "$stage" \
+              || echo "  (need ≥2 usable replicates for $stage — skipped)"
+            echo "::endgroup::"
+          done
+
+      - name: Drop raw transcripts (bulky; verdicts live in payload.json)
+        run: find "$RESULTS_DIR/runs" -name 'transcript.json.gz' -delete || true
+
+      - name: Commit & push results to eval repo
+        if: ${{ inputs.push_results != 'false' }}
+        working-directory: ${{ github.workspace }}/eval-results
+        run: |
+          git config user.name  "wafflebase-eval-bot"
+          git config user.email "wafflebase-eval-bot@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "no changes to commit"; exit 0
+          fi
+          git commit -m "stage-pilot: $SV pr-${{ inputs.stage_pr }} K${{ inputs.stage_k }} (run ${{ github.run_id }})"
+          git push origin HEAD:main
+
+      - name: Upload results (backup artifact)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage-pilot-${{ inputs.corpus_version }}-pr${{ inputs.stage_pr }}-K${{ inputs.stage_k }}
           path: ${{ env.RESULTS_DIR }}
           retention-days: 30

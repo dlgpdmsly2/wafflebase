@@ -65,6 +65,41 @@ node eval/reliability.mjs --out "$EVAL" --config-hash sha256:<hash> --corpus-ver
 git -C "$EVAL" add -A && git -C "$EVAL" commit -m "pilot runs + reliability score"
 ```
 
+## Mode A — stage-isolated reliability
+
+The whole-panel scorer above measures one thing: does the panel, re-run on a frozen
+diff, reach the same **gate verdict**? Mode A instead freezes the input to **one
+stage** and replays just that stage K times, so you learn *which* stage is noisy —
+cheaper and attributable (the motivating PR #521 flip is a *verifier* event,
+invisible to a whole-panel pass). Full contract: [`stage-artifacts.md`](stage-artifacts.md).
+
+| File | Role | Model calls? |
+|---|---|---|
+| `stage-artifacts.mjs` | the `stage-artifacts/v1` schema + a strict validator | no |
+| `stage-capture.mjs` | project a captured panel run → validated detection/verifier/gate artifacts | no |
+| `extract-stage-fixtures.mjs` | harvest a captured run's fixtures → `stage-fixtures/<v>` corpus (offline) | no |
+| `stage-adapters.mjs` | per-stage adapters (gate=pure; detection/verifier reuse `runLens`/`verifyFinding`) | detection/verifier **yes** |
+| `stage-run.mjs` | replay one stage over its fixtures under a run_id (K = K run_ids) | via adapter |
+| `stage-reliability.mjs` | per-stage flip-rate + Fleiss κ (gate/verifier); overlap (detection) | no |
+
+Runbook — one item, K=2 (only the capture is panel-scale):
+
+```bash
+V=2026-07-28-pilot; SV="${V}__stagepilot"; PR=521
+# 1. capture ONE item (a real panel run → per-stage detail in the payload)
+node eval/run.mjs --out "$EVAL" --corpus-version "$V" --items "pr-$PR" --run-id stage-capture
+# 2. harvest frozen fixtures (offline, free)
+node eval/extract-stage-fixtures.mjs --out "$EVAL" --run-id stage-capture --stage-version "$SV"
+# 3. replay each stage K=2 times (verifier/detection need repo context: --repo-source)
+for k in 1 2; do for s in gate verifier detection; do
+  node eval/stage-run.mjs --out "$EVAL" --stage-version "$SV" --stage "$s" --run-id "$s-$k" --repo-source ../../..
+done; done
+# 4. per-stage reliability vector
+for s in gate verifier detection; do node eval/stage-reliability.mjs --out "$EVAL" --stage-version "$SV" --stage "$s"; done
+```
+
+On CI: dispatch `agent-eval` with **`mode: stage-pilot`** (inputs `stage_pr`, `stage_k`).
+
 ## Fidelity to production
 
 The harness invokes the **exact** `review-panel.mjs` orchestrator (not a
