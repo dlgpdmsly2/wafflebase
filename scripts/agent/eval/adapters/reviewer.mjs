@@ -68,15 +68,22 @@ export function reviewerAdapter({ panelScript }) {
       const lensStats = readJson(path.join(outDir, "review-lens-stats.json")) ?? [];
       const executionMessages = readJson(path.join(outDir, "review-execution.json")) ?? [];
 
-      // Kept/gate findings from each lens's verdict.json, tagged by lens.
+      // Kept/gate findings from each lens's verdict.json, tagged by lens; plus the
+      // per-lens stage-detail.json the panel emits (raw per-sample findings +
+      // per-finding verifier verdicts) — the per-instance material stage-capture.mjs
+      // projects into stage artifacts. Absent for skipped/failed lenses (no sampling
+      // ran), so keyed by lens only when present.
       const findings = [];
+      const stageDetail = {};
       for (const entry of panel) {
         const verdict = readJson(path.join(outDir, entry.id, "verdict.json"));
         for (const f of verdict?.findings ?? []) {
           findings.push({ lens: entry.id, severity: f.severity, file: f.file, summary: f.summary, evidence: f.evidence });
         }
+        const detail = readJson(path.join(outDir, entry.id, "stage-detail.json"));
+        if (detail) stageDetail[entry.id] = detail;
       }
-      const payload = { adapter: "reviewer", panel, lensStats, findings };
+      const payload = { adapter: "reviewer", panel, lensStats, findings, stageDetail };
       return { payload, executionMessages };
     },
   };

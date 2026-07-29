@@ -223,14 +223,26 @@ fails toward *blocking*, a validator fails toward *rejection* — its job is to 
 malformed fixture before it poisons a replay. It reports every problem as a
 `"path: message"` string rather than throwing on the first.
 
-## 7. Forward references (not in this task)
+## 7. Emission & forward references
 
-- **Emission (task 2).** `review-panel.mjs` will write these artifacts per stage
-  into the item's out dir during a normal run. This doc fixes the shape it must
-  emit; the finding identity (`findingKey`), the severity/confidence/agreement
-  enums, and the `refutationGround` set are shared with the panel so capture is a
-  projection of what the panel already computes, not a re-derivation. Task 2 must
-  be authored against the rebased (upstream) pipeline — see the banner in §0.
+- **Emission — DONE (task 2), as a two-part split, not a single writer.** The panel
+  cannot emit a *complete* artifact: it does not know its `run_id` / `config_hash` /
+  `item_id` (those are harness concepts, and it also runs in the real issue→PR
+  workflow). So:
+  - **`review-panel.mjs`** writes only the raw per-instance DETAIL it uniquely holds
+    and used to discard — each lens's `stage-detail.json` = `{ samples: [[Finding…]…],
+    verifications: [{ population, finding, verdict, dropped }…] }` — dependency-free,
+    in the same style as the diagnostic files it already writes. The reviewer adapter
+    surfaces it as `payload.stageDetail`.
+  - **`stage-capture.mjs`** (`buildStageArtifacts(captured, ctx)`) projects that detail
+    into these validated artifacts, stamping provenance/`item_id`/input BlobRefs, and
+    **reusing the panel's own exported helpers** (`unionSamples`,
+    `compareSampleAgreement`, `changedFileContext`, `VERIFIER_MAX_TURNS`) so the union,
+    agreement label, and trust context are computed by the exact code that ran — no
+    re-derivation that could drift. It `assertStageArtifact`s every record.
+- **Fixture store (task 3).** Wire `buildStageArtifacts` into `run.mjs` at capture
+  time and harvest the results into `stage-fixtures/<version>`, keyed by
+  `stageInstanceKey`, deduping BlobRef blobs by `sha256`.
 - **Fixture store (task 3).** The extractor harvests each stage's frozen input into
   `stage-fixtures/<version>`, keyed by `stageInstanceKey`, deduping BlobRef blobs by
   `sha256`.

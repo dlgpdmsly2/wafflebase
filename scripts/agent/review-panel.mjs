@@ -486,7 +486,9 @@ async function runLens(lens, { rubric, diff, issue, repo, sessionLog }) {
 // repository instead of being handed a diff, so it needs tool calls — but it is
 // judging ONE finding, and an unbounded budget multiplies across every blocking
 // finding in every round.
-const VERIFIER_MAX_TURNS = 8;
+// Exported so the offline stage-capture harness records the SAME turn budget the
+// verifier actually ran under, rather than a drifting hardcoded copy.
+export const VERIFIER_MAX_TURNS = 8;
 
 async function verifyFinding(finding, { rubric, repo, model, sessionLog, changedContext }) {
   // INDEPENDENCE — the point of this function. The verifier is deliberately NOT
@@ -733,6 +735,23 @@ async function main() {
     // Merge fresh + still-open prior findings; dedupe collapses a prior finding
     // the fresh pass also re-found (and never merges two distinct bugs).
     const merged = dedupeFindings([...kept, ...priorKept]);
+
+    // Per-finding decision DETAIL — raw material for stage-isolated reliability
+    // (Mode A). The tallies below record HOW MANY findings each stage moved; this
+    // records WHICH sample raised what and how the verifier ruled on each finding,
+    // the per-instance data an offline harness needs to replay a single stage K
+    // times. Dependency-free JSON into the lens out dir, like verdict.json. Only
+    // blocking findings ever reach the verifier, so `verifications` mirrors that
+    // gate (`verdict: null` = a blocking finding the verifier errored on → kept).
+    const verifications = [
+      ...findings.map((f, i) => ({ population: "fresh", finding: f, verdict: verdicts[i] ?? null, dropped: isDroppingVerdict(verdicts[i], verifyOpts) })),
+      ...priorForLens.map((f, i) => ({ population: "prior-round", finding: f, verdict: priorVerdicts[i] ?? null, dropped: isDroppingVerdict(priorVerdicts[i], verifyOpts) })),
+    ].filter((v) => BLOCKING.has(normalizeSeverity(v.finding.severity)));
+    mkdirSync(lensOut, { recursive: true });
+    writeFileSync(
+      path.join(lensOut, "stage-detail.json"),
+      JSON.stringify({ samples: ok.map((r) => (Array.isArray(r.findings) ? r.findings : [])), verifications }) + "\n",
+    );
 
     // Reliability signals for this round: did the samples agree (fresh pass
     // only — prior-round re-checks aren't a sampling question), and what did
