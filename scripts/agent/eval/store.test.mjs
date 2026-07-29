@@ -133,3 +133,19 @@ test("stage artifacts: write-once per key, get + list", () => {
     assert.deepEqual(store.listStageArtifacts("EMPTY"), []);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("stage runs: write-once per (runId, fixtureRef); has/get/list/listIds", () => {
+  const { store, root } = tmpStore();
+  try {
+    const env = { run_id: "SR1", stage_id: "gate", fixture_ref: "pr-1::gate", output: { verdict: "block" } };
+    assert.equal(store.hasStageRun("V", "SR1", "pr-1::gate"), false);
+    store.putStageRun("V", "SR1", "pr-1::gate", env);
+    assert.equal(store.hasStageRun("V", "SR1", "pr-1::gate"), true);
+    assert.equal(store.getStageRun("V", "SR1", "pr-1::gate").output.verdict, "block");
+    assert.throws(() => store.putStageRun("V", "SR1", "pr-1::gate", env), /write-once/);
+    store.putStageRun("V", "SR2", "pr-1::gate", { ...env, run_id: "SR2" }); // different replicate
+    assert.equal(store.listStageRun("V", "SR1").length, 1);
+    assert.deepEqual(store.listStageRunIds("V").sort(), ["SR1", "SR2"]);
+    assert.deepEqual(store.listStageRun("V", "MISSING"), []);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

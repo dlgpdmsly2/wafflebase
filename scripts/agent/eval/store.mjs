@@ -206,6 +206,43 @@ export class GitFsStore {
       .map((f) => this._readJson(path.join(dir, f)));
   }
 
+  // --- stage runs (Mode A: replicate replays of one STAGE against its fixtures) -
+  // A stage-run is one replay of a stage adapter over a stage-fixtures corpus under
+  // a run_id; K replicates = K run_ids. Envelopes carry `stage_id` + `fixture_ref`
+  // (the stageInstanceKey replayed), so a per-stage reliability scorer groups
+  // envelopes across run_ids by fixture_ref. Layout: stage-runs/<version>/<runId>/.
+
+  _stageRunDir(version, runId) { return this._p("stage-runs", safeSeg(version), safeSeg(runId)); }
+  _stageRunPath(version, runId, fixtureRef) {
+    const fname = createHash("sha256").update(String(fixtureRef), "utf8").digest("hex");
+    return path.join(this._stageRunDir(version, runId), `${fname}.json`);
+  }
+
+  hasStageRun(version, runId, fixtureRef) { return existsSync(this._stageRunPath(version, runId, fixtureRef)); }
+
+  /** Write-once per (runId, fixtureRef) — one replay per fixture per run. The
+   * runner calls hasStageRun() to skip on resume. */
+  putStageRun(version, runId, fixtureRef, envelope) {
+    const p = this._stageRunPath(version, runId, fixtureRef);
+    if (existsSync(p)) throw new Error(`putStageRun: ${version}/${runId}/${fixtureRef} already written (write-once)`);
+    this._writeJson(p, envelope);
+  }
+
+  getStageRun(version, runId, fixtureRef) { return this._readJson(this._stageRunPath(version, runId, fixtureRef)); }
+
+  /** All envelopes for one stage-run. */
+  listStageRun(version, runId) {
+    const dir = this._stageRunDir(version, runId);
+    if (!existsSync(dir)) return [];
+    return readdirSync(dir).filter((f) => f.endsWith(".json")).sort().map((f) => this._readJson(path.join(dir, f)));
+  }
+
+  /** Run dirs under a stage-fixtures version (the K replicates to aggregate over). */
+  listStageRunIds(version) {
+    const dir = this._p("stage-runs", safeSeg(version));
+    return existsSync(dir) ? readdirSync(dir).sort() : [];
+  }
+
   // --- labels (Track B — reserved) ------------------------------------------
 
   getLabels(corpusVersion, itemId) {

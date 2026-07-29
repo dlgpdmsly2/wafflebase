@@ -249,10 +249,17 @@ malformed fixture before it poisons a replay. It reports every problem as a
   `blobs/` (deduped by `sha256`). No model calls; only `status: "ok"` items are
   harvested. Store surface: `putStageBlob`/`getStageBlob`,
   `putStageArtifact`/`getStageArtifact`/`listStageArtifacts` on `GitFsStore`.
-- **Fixture store (task 3).** The extractor harvests each stage's frozen input into
-  `stage-fixtures/<version>`, keyed by `stageInstanceKey`, deduping BlobRef blobs by
-  `sha256`.
-- **Stage-level adapter (task 4).** The Target Adapter seam generalizes so a
-  *stage* is a target; `prepareInput` loads a frozen upstream artifact (this shape)
-  instead of the raw diff — and, for the verifier, must materialize `repo_commit`
-  (see the fidelity note in §4).
+- **Stage-level adapter seam — DONE (task 4).** `stage-adapters.mjs` makes a *stage*
+  a target: `prepareInput(fixture, …)` loads a frozen artifact (`resolveBlobRef`
+  turns BlobRefs back into content), `runReplica → { output, sessionLog }` replays
+  the stage. `stage-run.mjs` (`runStage`) loops a stage's fixtures under a `run_id`
+  (K replicates = K run_ids, resumable) and writes stage-run envelopes carrying
+  `stage_id` + `fixture_ref`; the store gained `putStageRun`/`getStageRun`/
+  `listStageRun`/`listStageRunIds`. The **gate** adapter is implemented (pure →
+  free, deterministic; the gate determinism check). **DETECTION and VERIFIER
+  adapters land next** — they invoke the model, will reuse `review-panel.mjs`'s
+  `runLens`/`verifyFinding` on the materialized frozen input, and the verifier
+  needs `repo_commit` materialized (fidelity note, §4).
+- **Per-stage metrics (task 5).** Group stage-run envelopes across `run_id`s by
+  `fixture_ref`: binary flip-rate + Fleiss κ for verifier/gate; positive
+  overlap/Jaccard for detection.
