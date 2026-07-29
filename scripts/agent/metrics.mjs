@@ -168,7 +168,17 @@ export function aggregatePanelStats(entries) {
   const agreementCounts = { identical: 0, partial: 0, disjoint: 0, single: 0 };
   const raised = { critical: 0, major: 0, minor: 0, nit: 0 };
   const kept = { critical: 0, major: 0, minor: 0, nit: 0 };
-  let sentToVerifier = 0, refuted = 0, refutedHighConfidence = 0;
+  // Confidence of what each lens RAISED. Entries written before the field
+  // existed contribute nothing at all — not even to `unknown` — so an all-zero
+  // row means "no data yet", which is the honest reading for a PR whose rounds
+  // predate the change. Within a round that does carry the field, `unknown`
+  // counts findings the lens declined to rate.
+  const raisedConfidence = { high: 0, medium: 0, low: 0, unknown: 0 };
+  // `dropped` is absent from ledger entries written before the grounded-refute
+  // change; those coerce to 0, which reads correctly — under the old rule the
+  // drop count WAS `refutedHighConfidence`, so a mixed-history PR shows the
+  // grounded drops it can actually account for rather than an inflated total.
+  let sentToVerifier = 0, refuted = 0, refutedHighConfidence = 0, dropped = 0;
   for (const e of list) {
     if (!e || typeof e !== "object") continue;
     if (Object.prototype.hasOwnProperty.call(agreementCounts, e.agreement)) agreementCounts[e.agreement]++;
@@ -176,11 +186,18 @@ export function aggregatePanelStats(entries) {
       raised[sev] += Number(e.raised && e.raised[sev]) || 0;
       kept[sev] += Number(e.kept && e.kept[sev]) || 0;
     }
+    for (const c of ["high", "medium", "low", "unknown"]) {
+      raisedConfidence[c] += Number(e.raisedConfidence && e.raisedConfidence[c]) || 0;
+    }
     sentToVerifier += Number(e.verifier && e.verifier.sentToVerifier) || 0;
     refuted += Number(e.verifier && e.verifier.refuted) || 0;
     refutedHighConfidence += Number(e.verifier && e.verifier.refutedHighConfidence) || 0;
+    dropped += Number(e.verifier && e.verifier.dropped) || 0;
   }
-  return { agreementCounts, raised, kept, verifier: { sentToVerifier, refuted, refutedHighConfidence } };
+  return {
+    agreementCounts, raised, raisedConfidence, kept,
+    verifier: { sentToVerifier, refuted, refutedHighConfidence, dropped },
+  };
 }
 
 /**
@@ -331,6 +348,7 @@ export function renderSummary({ agg, panelAgg, panelStats, flips, scope }) {
   if (hasPanel) {
     const ac = panelStats?.agreementCounts || {};
     const r = panelStats?.raised || {};
+    const rc = panelStats?.raisedConfidence || {};
     const k = panelStats?.kept || {};
     const v = panelStats?.verifier || {};
     const sampledRounds = (ac.identical || 0) + (ac.partial || 0) + (ac.disjoint || 0);
@@ -350,11 +368,20 @@ export function renderSummary({ agg, panelAgg, panelStats, flips, scope }) {
       // one — see the meta-eval's reliability≠validity finding.
       `- Reliability (intra-round self-consistency, not correctness): ${ac.identical || 0} identical, ${ac.partial || 0} partial, ${ac.disjoint || 0} disjoint across ${sampledRounds} lens-rounds`,
       `- Findings raised: ${r.critical || 0} critical, ${r.major || 0} major, ${r.minor || 0} minor, ${r.nit || 0} nit`,
+      // Severity and confidence are separate axes; this row is the check that
+      // the lenses are actually USING the second one. All-`high` (or all
+      // `unknown`) means doubt has nowhere to go but severity, which is the
+      // clamp the coverage-first rubrics exist to remove. Confidence gates
+      // nothing — a low-confidence `critical` blocks exactly like any other.
+      `- Confidence of raised (does NOT gate): ${rc.high || 0} high, ${rc.medium || 0} medium, ${rc.low || 0} low, ${rc.unknown || 0} unrated`,
       // Weighted scalar companion to the raw vector above — an effort/noise
       // proxy, not recall (no ground truth here). Shown alongside, not instead.
       `- Weighted raised (effort proxy, not recall): ${weightSeverity(r)}`,
       `- Sent to verifier: ${v.sentToVerifier || 0}`,
-      `- Refuted: ${v.refuted || 0} (${v.refutedHighConfidence || 0} high-confidence)`,
+      // `dropped` ≤ `refutedHighConfidence`: a confident refutation only drops
+      // the finding when it names a ground and cites what it read. The GAP is
+      // the signal — it counts refutations the gate declined to act on.
+      `- Refuted: ${v.refuted || 0} (${v.refutedHighConfidence || 0} high-confidence, ${v.dropped || 0} dropped)`,
       // All four severities shown (critical/major lead as the blocking ones)
       // so the raw counts reconcile with the weighted scalar below, which
       // weights every severity — mirrors the "Findings raised" pair above.

@@ -8,11 +8,15 @@ import {
   lensApplies,
   dedupeFindings,
   applyVerifications,
+  isDroppingVerdict,
+  changedFileContext,
   coerceFindings,
   unionSamples,
   parsePriorFindings,
   compareSampleAgreement,
   severityCounts,
+  confidenceCounts,
+  LENS_CLOSING_INSTRUCTION,
   verifierTally,
   classifyResult,
   withRetry,
@@ -84,6 +88,75 @@ test("lensApplies: path-scoped lenses skip docs-only diffs; correctness always a
   const workflow = [".github/workflows/agent-implement.yml"];
   assert.equal(lensApplies(security, workflow), true);
   assert.equal(lensApplies(testAdequacy, workflow), false);
+
+  // blast-radius shares test-adequacy's code scope: out-of-diff impact is a
+  // property of CODE, so a docs-only change has none to find.
+  const blastRadius = lensOf("blast-radius");
+  assert.equal(lensApplies(blastRadius, code), true);
+  assert.equal(lensApplies(blastRadius, docsOnly), false);
+  assert.equal(lensApplies(blastRadius, plainDocs), false);
+  // Deliberately NOT scoped to workflows yet — see the task doc. Asserted so the
+  // choice is visible rather than incidental, and so extending it is a conscious
+  // edit to this line.
+  assert.equal(lensApplies(blastRadius, workflow), false);
+});
+
+// The out-of-diff mandate added to correctness + security. The motivating bug —
+// a new read-only guard with `EditorAPI.paste()` reaching the same mutation
+// around it — was passed twice by both lenses because the bypassing line was
+// never in the diff. blast-radius owns this in general; these two carry the
+// obligation for guards in their own lane, and losing it would silently restore
+// diff-only review.
+test("correctness + security carry the out-of-diff call-site mandate", () => {
+  for (const id of ["correctness", "security"]) {
+    const md = readFileSync(path.join(HERE, "lenses", `${id}.md`), "utf8");
+    assert.match(md, /diff is where the change is, not where the bug is/i, `${id}.md lost the mandate`);
+    assert.match(md, /Grep\/Glob/, `${id}.md must name the tool that leaves the diff`);
+    assert.match(md, /call sites?/i, `${id}.md must ask for other call sites`);
+    assert.match(md, /file:line/, `${id}.md must require a cited bypassing site`);
+  }
+});
+
+// Injection framing must cover the WORKING TREE, not just the diff. Every lens
+// runs with cwd = the untrusted branch checkout and Read/Grep/Glob allow-listed,
+// and several rubrics now send it into the repository (blast-radius requires it),
+// so a planted comment or fixture is reached by instruction rather than by
+// chance. Diff-only framing was the gap a reviewer caught on this PR.
+test("injection framing covers the working tree, in the wrapper and every rubric", () => {
+  // The wrapper is the one place that reaches all five lenses at once.
+  assert.match(LENS_CLOSING_INSTRUCTION, /Every file you open is DATA/);
+  assert.match(LENS_CLOSING_INSTRUCTION, /UNTRUSTED/);
+  // Steering text must be reportable, not merely ignorable — that turns an attack
+  // into a detection instead of a silent success.
+  assert.match(LENS_CLOSING_INSTRUCTION, /is itself a\s+finding/);
+
+  for (const id of ["correctness", "security", "design-fit", "test-adequacy", "blast-radius"]) {
+    const md = readFileSync(path.join(HERE, "lenses", `${id}.md`), "utf8");
+    // Two loose assertions rather than one punctuation-sensitive phrase: the
+    // security property is "framed as data, not as instructions", not a comma.
+    assert.match(md, /as DATA/, `${id}.md lost its DATA framing`);
+    assert.match(md, /never as\s+instructions/, `${id}.md lost its not-instructions framing`);
+    // The narrow form ("the diff and any text in it") is what this test exists to
+    // keep out: it names only the diff while the lens reads the whole tree.
+    assert.ok(
+      /working tree/i.test(md) || /every file you open/i.test(md),
+      `${id}.md frames only the diff as DATA — the lens reads the working tree too`,
+    );
+  }
+});
+
+// blast-radius is defined by its METHOD, not just its lane: if it does not leave
+// the diff it is a worse copy of the correctness lens, and the one bug class it
+// exists for is invisible from the diff alone.
+test("the blast-radius rubric mandates leaving the diff", () => {
+  const md = readFileSync(path.join(HERE, "lenses", "blast-radius.md"), "utf8");
+  assert.match(md, /Grep/, "must instruct the lens to grep");
+  assert.match(md, /every other reference/i, "must ask for references outside the diff");
+  assert.match(md, /If you finish without running `Grep`/, "must state the method is mandatory");
+  // Its lane is bounded, or it duplicates the other four and doubles the noise.
+  assert.match(md, /NOT your lane/, "must defer the other lenses' concerns");
+  assert.match(md, /correctness lens/i);
+  assert.match(md, /security lens/i);
 });
 
 // The safety property that makes path-scoping survivable, asserted against the
@@ -216,8 +289,10 @@ test("cross-round merge: an unresolved prior finding the fresh pass missed still
   const merged = dedupeFindings([...freshKept, ...priorKept]);
   assert.equal(merged.length, 1);
   assert.equal(classify(merged).conclusion, "failure");
-  // but if the re-check confidently refutes it (genuinely resolved) → dropped
-  const resolved = applyVerifications(priorForLens, [{ verdict: "refuted", confidence: "high" }]);
+  // but if the re-check refutes it on grounded evidence (genuinely resolved) → dropped
+  const resolved = applyVerifications(priorForLens, [
+    { verdict: "refuted", confidence: "high", refutationGround: "not-present", groundedIn: ["s.ts:88"] },
+  ]);
   assert.equal(classify(dedupeFindings([...freshKept, ...resolved])).conclusion, "success");
 });
 
@@ -248,31 +323,263 @@ test("severityCounts: tallies by normalized severity, unknown → major", () => 
     { critical: 2, major: 1, minor: 1, nit: 0 },
   );
   assert.deepEqual(severityCounts("not an array"), { critical: 0, major: 0, minor: 0, nit: 0 });
+  // Severity and confidence are independent axes. A low-confidence critical is
+  // still a critical — if confidence ever starts influencing this count, the
+  // clamp the coverage-first rubrics removed has grown back inside the script.
+  assert.deepEqual(
+    severityCounts([
+      { severity: "critical", confidence: "low" },
+      { severity: "critical", confidence: "high" },
+      { severity: "major", confidence: "low" },
+    ]),
+    { critical: 2, major: 1, minor: 0, nit: 0 },
+  );
 });
 
-test("verifierTally: only blocking findings are sent; refuted vs high-confidence-refuted", () => {
+test("confidenceCounts: buckets by confidence; anything unrated → unknown", () => {
+  assert.deepEqual(confidenceCounts([]), { high: 0, medium: 0, low: 0, unknown: 0 });
+  assert.deepEqual(
+    confidenceCounts([{ confidence: "high" }, { confidence: "low" }, { confidence: "low" }, { confidence: "medium" }]),
+    { high: 1, medium: 1, low: 2, unknown: 0 },
+  );
+  // Unrated does NOT get coerced into a real bucket the way severity does. A
+  // lens that stops emitting confidence must show up as `unknown`, because that
+  // is the signal that it is back to expressing doubt through severity.
+  assert.deepEqual(
+    confidenceCounts([{ severity: "major" }, { confidence: "wat" }, { confidence: 7 }, { confidence: null }]),
+    { high: 0, medium: 0, low: 0, unknown: 4 },
+  );
+  // "unknown" is not a value a lens can claim — it means "not rated"
+  assert.deepEqual(confidenceCounts([{ confidence: "unknown" }]), { high: 0, medium: 0, low: 0, unknown: 1 });
+  // REGRESSION: an `in` check walks the prototype chain, so these matched,
+  // incremented an inherited property, and left an extra key on the result —
+  // while also NOT counting the finding under `unknown`. Both must hold: the
+  // shape is exactly four keys, and nothing goes uncounted.
+  for (const proto of ["constructor", "toString", "hasOwnProperty", "__proto__", "valueOf"]) {
+    const out = confidenceCounts([{ confidence: proto }]);
+    assert.deepEqual(out, { high: 0, medium: 0, low: 0, unknown: 1 }, `"${proto}" must count as unknown`);
+    assert.deepEqual(Object.keys(out), ["high", "medium", "low", "unknown"], `"${proto}" added a key`);
+  }
+  // junk input never throws
+  for (const bad of ["not an array", null, undefined, 7, {}]) {
+    assert.deepEqual(confidenceCounts(bad), { high: 0, medium: 0, low: 0, unknown: 0 });
+  }
+  assert.deepEqual(confidenceCounts([null, 7, "x"]), { high: 0, medium: 0, low: 0, unknown: 3 });
+});
+
+// Read the REAL rubrics, same reasoning as the manifest above: these files ARE
+// the behaviour, and a clamp re-added by hand is invisible to every other test.
+//
+// Phrases that make a lens investigate thoroughly and then decline to report —
+// the documented failure mode this whole change exists to remove.
+const CLAMPS = [
+  /when unsure,?\s+downgrade/i,
+  /mark it minor/i,
+  /only with (?:a )?concrete/i,
+  /ONLY for a\s+concrete/i,
+  /severity ONLY/i,
+];
+const assertNoClamp = (text, where) => {
+  for (const clamp of CLAMPS) {
+    assert.ok(!clamp.test(text), `${where} re-introduces a certainty clamp: ${clamp}`);
+  }
+};
+
+test("lens rubrics are coverage-first, with no certainty clamp", () => {
+  const RUBRICS = ["correctness", "security", "design-fit", "test-adequacy", "blast-radius"];
+  for (const id of RUBRICS) {
+    const md = readFileSync(path.join(HERE, "lenses", `${id}.md`), "utf8");
+    assertNoClamp(md, `${id}.md`);
+    assert.match(md, /Report EVERY issue you find/, `${id}.md must instruct coverage-first`);
+    assert.match(md, /[Nn]ever downgrade\s+severity/, `${id}.md must separate severity from doubt`);
+    assert.match(md, /confidence/i, `${id}.md must tell the lens what confidence is for`);
+  }
+  // Every rubric in the manifest is covered by the loop above — otherwise a new
+  // lens could ship with a clamp and nothing here would notice.
+  assert.deepEqual(LENSES.map((l) => l.id).sort(), [...RUBRICS].sort());
+});
+
+// The rubrics are only half the prompt. `runLens` appends this block AFTER the
+// rubric and the diff, so it is the last thing the lens reads and wins ties —
+// and it is where the real clamp was hiding, in the one place nobody editing a
+// rubric would look. Guarding the .md files alone would leave that reachable.
+test("the runLens closing instruction is coverage-first too", () => {
+  assertNoClamp(LENS_CLOSING_INSTRUCTION, "LENS_CLOSING_INSTRUCTION");
+  assert.match(LENS_CLOSING_INSTRUCTION, /Report EVERY issue you find/);
+  assert.match(LENS_CLOSING_INSTRUCTION, /never lower severity to signal doubt/);
+  // ...but the KIND rule stays: taste is minor/nit no matter how sure you are.
+  // That is not a certainty clamp, and losing it would let preferences block.
+  assert.match(LENS_CLOSING_INSTRUCTION, /[Tt]aste[\s\S]*minor\/nit/);
+  // It must actually reach the prompt. An exported constant nothing appends is
+  // a guard over dead text — the exact failure this test exists to prevent.
+  const src = readFileSync(path.join(HERE, "review-panel.mjs"), "utf8");
+  assert.match(src, /parts\.push\(\s*""\s*,\s*LENS_CLOSING_INSTRUCTION\s*\)/,
+    "runLens must append LENS_CLOSING_INSTRUCTION, or this guard covers nothing");
+});
+
+test("verifierTally: only blocking findings are sent; refuted vs high-confidence vs dropped", () => {
   const findings = [
     { severity: "critical", summary: "c" },
     { severity: "major", summary: "m" },
     { severity: "minor", summary: "n" }, // never sent to the verifier
   ];
   const verdicts = [{ verdict: "refuted", confidence: "high" }, { verdict: "refuted", confidence: "low" }, null];
-  assert.deepEqual(verifierTally(findings, verdicts), { sentToVerifier: 2, refuted: 2, refutedHighConfidence: 1 });
+  // the high-confidence refute is UNGROUNDED, so it is counted but not dropped —
+  // this gap is the whole point of reporting both numbers.
+  assert.deepEqual(verifierTally(findings, verdicts), { sentToVerifier: 2, refuted: 2, refutedHighConfidence: 1, dropped: 0 });
+  // the same shape WITH a ground and a citation does drop
+  assert.deepEqual(
+    verifierTally(findings, [GROUNDED_REFUTE, { verdict: "refuted", confidence: "low" }, null]),
+    { sentToVerifier: 2, refuted: 2, refutedHighConfidence: 1, dropped: 1 },
+  );
   // confirmed / null verdicts: sent but not refuted
   assert.deepEqual(
     verifierTally(findings, [{ verdict: "confirmed", confidence: "high" }, null, null]),
-    { sentToVerifier: 2, refuted: 0, refutedHighConfidence: 0 },
+    { sentToVerifier: 2, refuted: 0, refutedHighConfidence: 0, dropped: 0 },
   );
-  assert.deepEqual(verifierTally([], []), { sentToVerifier: 0, refuted: 0, refutedHighConfidence: 0 });
+  assert.deepEqual(verifierTally([], []), { sentToVerifier: 0, refuted: 0, refutedHighConfidence: 0, dropped: 0 });
+  // a dropping verdict on a NON-blocking finding is not counted: it was never
+  // sent, and applyVerifications would not have acted on it either.
+  assert.deepEqual(
+    verifierTally([{ severity: "minor", summary: "n" }], [GROUNDED_REFUTE]),
+    { sentToVerifier: 0, refuted: 0, refutedHighConfidence: 0, dropped: 0 },
+  );
 });
 
-test("applyVerifications: drops ONLY on high-confidence refuted; keeps on any doubt", () => {
+/** The one verdict shape that is allowed to drop a finding. */
+const GROUNDED_REFUTE = {
+  verdict: "refuted",
+  confidence: "high",
+  refutationGround: "not-present",
+  groundedIn: ["src/a.ts:42"],
+};
+
+test("isDroppingVerdict: drops only on the complete grounded shape", () => {
+  assert.ok(isDroppingVerdict(GROUNDED_REFUTE));
+  // REGRESSION GUARD. This exact shape used to drop the finding. Under the
+  // grounded rule it must NOT: a confident assertion with no ground named and
+  // nothing cited is precisely what the gate stopped acting on. If this ever
+  // goes green again, the grounding requirement has been silently reverted.
+  assert.equal(isDroppingVerdict({ verdict: "refuted", confidence: "high" }), false);
+  // each piece of the shape removed in turn → keeps
+  const without = (k) => { const v = { ...GROUNDED_REFUTE }; delete v[k]; return v; };
+  for (const k of ["verdict", "confidence", "refutationGround", "groundedIn"]) {
+    assert.equal(isDroppingVerdict(without(k)), false, `missing ${k} must keep the finding`);
+  }
+  // wrong values for each field → keeps
+  assert.equal(isDroppingVerdict({ ...GROUNDED_REFUTE, verdict: "confirmed" }), false);
+  assert.equal(isDroppingVerdict({ ...GROUNDED_REFUTE, confidence: "low" }), false);
+  // `none` is a legal enum value meaning "I am not refuting" — never drops
+  assert.equal(isDroppingVerdict({ ...GROUNDED_REFUTE, refutationGround: "none" }), false);
+  // a ground outside the enum is not a ground (guards a model inventing one)
+  assert.equal(isDroppingVerdict({ ...GROUNDED_REFUTE, refutationGround: "looks-fine" }), false);
+  assert.equal(isDroppingVerdict({ ...GROUNDED_REFUTE, refutationGround: 1 }), false);
+  // citations that cite nothing → keeps
+  assert.equal(isDroppingVerdict({ ...GROUNDED_REFUTE, groundedIn: [] }), false);
+  assert.equal(isDroppingVerdict({ ...GROUNDED_REFUTE, groundedIn: ["", "   "] }), false);
+  assert.equal(isDroppingVerdict({ ...GROUNDED_REFUTE, groundedIn: [null, 7] }), false);
+  assert.equal(isDroppingVerdict({ ...GROUNDED_REFUTE, groundedIn: "src/a.ts:42" }), false);
+  // one usable citation among junk is enough
+  assert.ok(isDroppingVerdict({ ...GROUNDED_REFUTE, groundedIn: ["", "src/a.ts:42"] }));
+  // junk input never throws
+  for (const v of [null, undefined, 0, "", "refuted", [], {}]) {
+    assert.equal(isDroppingVerdict(v), false);
+  }
+});
+
+test("isDroppingVerdict: a citation must locate something, not just be non-empty", () => {
+  const cite = (...groundedIn) => isDroppingVerdict({ ...GROUNDED_REFUTE, groundedIn });
+  // prose is not a citation, however confident — this is the unevidenced
+  // assertion the grounding rule exists to reject, wearing a citation's costume.
+  for (const junk of ["looks fine", "I checked it", "the guard is there", "n/a", "-", "42", "src/a.ts"]) {
+    assert.equal(cite(junk), false, `"${junk}" must not count as a citation`);
+  }
+  // real locations, including ranges and prose wrapped around one
+  for (const ok of [
+    "src/a.ts:42",
+    "packages/docs/src/editor-api.ts:214-220",
+    "scripts/agent/review-panel.mjs:172",
+    "see review-panel.mjs:172 for the guard",
+    "a.ts:1",
+  ]) {
+    assert.ok(cite(ok), `"${ok}" must count as a citation`);
+  }
+});
+
+test("isDroppingVerdict: `pre-existing` needs an authoritative changed-file list", () => {
+  const preExisting = { ...GROUNDED_REFUTE, refutationGround: "pre-existing" };
+  // The prompt withdraws this ground when the list is not authoritative, but a
+  // prompt instruction the script does not check is not a rule — so the trusted
+  // code refuses it too. Without this the whole changed-file trust story is
+  // advisory, and a model ignoring the instruction drops a real finding.
+  assert.equal(isDroppingVerdict(preExisting, { allowPreExisting: false }), false);
+  assert.ok(isDroppingVerdict(preExisting, { allowPreExisting: true }));
+  // DEFAULT is the strict one: a caller that forgets to thread the flag gets the
+  // keep-the-finding behaviour, like every other default on this path.
+  assert.equal(isDroppingVerdict(preExisting), false);
+  assert.equal(isDroppingVerdict(preExisting, {}), false);
+  // the flag is scoped to `pre-existing` — it must not gate the other grounds
+  for (const g of ["not-present", "already-guarded", "out-of-scope"]) {
+    assert.ok(isDroppingVerdict({ ...GROUNDED_REFUTE, refutationGround: g }, { allowPreExisting: false }));
+  }
+  // ...and it never RELAXES anything else: an ungrounded pre-existing still keeps
+  assert.equal(
+    isDroppingVerdict({ verdict: "refuted", confidence: "high", refutationGround: "pre-existing" },
+      { allowPreExisting: true }),
+    false,
+  );
+});
+
+test("applyVerifications / verifierTally thread the pre-existing trust flag", () => {
+  const F = [{ severity: "major", summary: "m" }];
+  const V = [{ ...GROUNDED_REFUTE, refutationGround: "pre-existing" }];
+  assert.equal(applyVerifications(F, V, { allowPreExisting: true }).length, 0, "dropped when trusted");
+  assert.equal(applyVerifications(F, V, { allowPreExisting: false }).length, 1, "kept when not");
+  assert.equal(applyVerifications(F, V).length, 1, "kept by default");
+  // the tally must agree with the gate, or `dropped` reports a decision that
+  // was never made
+  assert.equal(verifierTally(F, V, { allowPreExisting: true }).dropped, 1);
+  assert.equal(verifierTally(F, V, { allowPreExisting: false }).dropped, 0);
+  assert.equal(verifierTally(F, V).dropped, 0);
+});
+
+test("changedFileContext: only a complete list is authoritative", () => {
+  assert.deepEqual(changedFileContext(["a.ts", "b.ts"], 5), {
+    authoritative: true, listed: ["a.ts", "b.ts"], total: 2,
+  });
+  // a full-length list is still complete — the cap is inclusive
+  assert.equal(changedFileContext(["a", "b"], 2).authoritative, true);
+  // ONE over the cap withdraws authority: an absent path would otherwise read as
+  // "the PR didn't touch it" when it was merely truncated off (the fail-open).
+  const over = changedFileContext(["a", "b", "c"], 2);
+  assert.equal(over.authoritative, false);
+  assert.deepEqual(over.listed, ["a", "b"]);
+  assert.equal(over.total, 3, "total reports the true count, not the listed count");
+  // empty / malformed → not authoritative, never throws
+  for (const bad of [[], null, undefined, "a.ts", 7, {}, [null, 7, "", "   "]]) {
+    const c = changedFileContext(bad, 5);
+    assert.equal(c.authoritative, false);
+    assert.deepEqual(c.listed, []);
+    assert.equal(c.total, 0);
+  }
+  // A single junk entry alongside real ones costs authority, for the same reason
+  // truncation does: the verifier would be handed a list missing a path it
+  // cannot see is missing — indistinguishable, from inside the prompt, from a
+  // file the PR genuinely did not touch. Junk still leaves `listed` clean.
+  const mixed = changedFileContext(["", null, "a.ts", 7], 5);
+  assert.deepEqual(mixed.listed, ["a.ts"]);
+  assert.equal(mixed.authoritative, false, "a dropped entry must cost authority");
+});
+
+test("applyVerifications: drops ONLY on a grounded refute; keeps on any doubt", () => {
   const F = [{ severity: "critical", summary: "c" }, { severity: "major", summary: "m" }, { severity: "minor", summary: "n" }];
   const keptSummaries = (verdicts) => applyVerifications(F, verdicts).map((f) => f.summary);
-  // high-confidence refuted → dropped
-  assert.ok(!keptSummaries([{ verdict: "refuted", confidence: "high" }, null, null]).includes("c"));
-  // low-confidence refuted → KEPT (uncertainty)
-  assert.ok(keptSummaries([{ verdict: "refuted", confidence: "low" }, null, null]).includes("c"));
+  // grounded high-confidence refute → dropped
+  assert.ok(!keptSummaries([GROUNDED_REFUTE, null, null]).includes("c"));
+  // ungrounded high-confidence refute → KEPT (the old dropping shape)
+  assert.ok(keptSummaries([{ verdict: "refuted", confidence: "high" }, null, null]).includes("c"));
+  // low-confidence refute, even grounded → KEPT (uncertainty)
+  assert.ok(keptSummaries([{ ...GROUNDED_REFUTE, confidence: "low" }, null, null]).includes("c"));
   // confirmed → kept
   assert.ok(keptSummaries([{ verdict: "confirmed", confidence: "high" }, null, null]).includes("c"));
   // null (verifier error) → kept
@@ -280,7 +587,7 @@ test("applyVerifications: drops ONLY on high-confidence refuted; keeps on any do
   // malformed (no confidence) → kept
   assert.ok(keptSummaries([{ verdict: "refuted" }, null, null]).includes("c"));
   // non-blocking (minor) is never verified/dropped
-  assert.ok(keptSummaries([null, null, { verdict: "refuted", confidence: "high" }]).includes("n"));
+  assert.ok(keptSummaries([null, null, GROUNDED_REFUTE]).includes("n"));
 });
 
 test("classifyResult: success with structured output → ok", () => {
