@@ -1,12 +1,20 @@
-# Offline replay eval harness — manual runs in a CLEAN CI environment.
+# Offline replay eval harness — manual runs in a clean CI environment.
 #
-# Why CI: the reviewer's repo-context checkout (git archive) is unreliable under
-# corporate EDR on a dev laptop; a GitHub runner has none of that, so context
-# loads fully and reproducibly. Runs are manual (workflow_dispatch) because each
-# spends real model budget. Results are uploaded as a downloadable artifact
-# (no write access to the private results repo needed).
+# Why CI: a GitHub runner is a clean, reproducible box (no dev-laptop state, no
+# local credential drift) and keeps the model spend + artifacts off the laptop.
+# Runs are manual (workflow_dispatch) because each spends real model budget.
 #
-# One-time setup: add repo secret CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`).
+# Results are BOTH (a) pushed to the public results repo dlgpdmsly2/wafflebase-agent-eval
+# (when push_results is on) AND (b) uploaded as a downloadable artifact (always, a
+# backup that survives even if the push is misconfigured).
+#
+# One-time setup — two repo secrets on THIS repo (the wafflebase fork, where the
+# workflow runs):
+#   CLAUDE_CODE_OAUTH_TOKEN  from `claude setup-token` (or an sk-ant-api03 API key)
+#   EVAL_REPO_TOKEN          a PAT with Contents:read/write on wafflebase-agent-eval
+#                            (the built-in GITHUB_TOKEN is scoped to THIS repo only
+#                            and cannot push to the separate results repo). Set it:
+#                              gh secret set EVAL_REPO_TOKEN -R dlgpdmsly2/wafflebase
 name: agent-eval
 
 on:
@@ -27,13 +35,35 @@ on:
       no_repo_context:
         description: "true = diff-only replay (skip repo checkout)"
         default: "false"
+      push_results:
+        description: "true = commit+push results to the eval repo (needs EVAL_REPO_TOKEN)"
+        default: "true"
 
 jobs:
   eval:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      # Results land directly inside a checkout of the eval repo, so a run is
+      # committed in place and re-runs resume against existing artifacts.
+      RESULTS_DIR: ${{ github.workspace }}/eval-results
     steps:
       - uses: actions/checkout@v4
+
+      # The results repo — checked out into ./eval-results with a token that can
+      # push back to it. persist-credentials (default true) keeps that auth for
+      # the later push. Skipped when push_results=false (artifact-only run).
+      - name: Checkout eval results repo
+        if: ${{ inputs.push_results != 'false' }}
+        uses: actions/checkout@v4
+        with:
+          repository: dlgpdmsly2/wafflebase-agent-eval
+          token: ${{ secrets.EVAL_REPO_TOKEN }}
+          path: eval-results
+          fetch-depth: 0
+
+      - name: Ensure results dir exists
+        run: mkdir -p "$RESULTS_DIR"
 
       - uses: actions/setup-node@v4
         with:
@@ -48,7 +78,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          node eval/extract-corpus.mjs --out "$RUNNER_TEMP/results" \
+          node eval/extract-corpus.mjs --out "$RESULTS_DIR" \
             --corpus-version "${{ inputs.corpus_version }}" --prs "${{ inputs.prs }}"
 
       - name: Run K replicate(s)
@@ -59,7 +89,7 @@ jobs:
           [ "${{ inputs.no_repo_context }}" = "true" ] && FLAG="--no-repo-context" || FLAG=""
           for i in $(seq 1 "${{ inputs.runs }}"); do
             echo "::group::run $i / ${{ inputs.runs }}"
-            node eval/run.mjs --out "$RUNNER_TEMP/results" \
+            node eval/run.mjs --out "$RESULTS_DIR" \
               --corpus-version "${{ inputs.corpus_version }}" \
               --config-id "${{ inputs.config_id }}" $FLAG | tee "run-$i.log"
             echo "::endgroup::"
@@ -71,15 +101,31 @@ jobs:
         working-directory: scripts/agent
         run: |
           HASH=$(cat "$RUNNER_TEMP/config_hash")
-          node eval/reliability.mjs --out "$RUNNER_TEMP/results" \
+          node eval/reliability.mjs --out "$RESULTS_DIR" \
             --config-hash "$HASH" --corpus-version "${{ inputs.corpus_version }}"
 
       - name: Drop raw transcripts (bulky; verdicts live in payload.json)
-        run: find "$RUNNER_TEMP/results/runs" -name 'transcript.json.gz' -delete || true
+        run: find "$RESULTS_DIR/runs" -name 'transcript.json.gz' -delete || true
 
-      - name: Upload results
+      # Commit whatever changed (new/updated corpus + run + scores). The eval
+      # repo's .gitignore already excludes transcripts, so add -A won't stage them.
+      - name: Commit & push results to eval repo
+        if: ${{ inputs.push_results != 'false' }}
+        working-directory: ${{ github.workspace }}/eval-results
+        run: |
+          git config user.name  "wafflebase-eval-bot"
+          git config user.email "wafflebase-eval-bot@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "no changes to commit"; exit 0
+          fi
+          git commit -m "eval: ${{ inputs.corpus_version }} K${{ inputs.runs }} — ${{ inputs.config_id }} (run ${{ github.run_id }})"
+          git push origin HEAD:main
+
+      - name: Upload results (backup artifact)
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: eval-${{ inputs.corpus_version }}-K${{ inputs.runs }}
-          path: ${{ runner.temp }}/results
+          path: ${{ env.RESULTS_DIR }}
           retention-days: 30
