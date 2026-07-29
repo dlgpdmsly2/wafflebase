@@ -45,7 +45,12 @@ const ctx = () => ({
   repo_commit: "deadbeef",
   changed_files: ["a.ts", "b.ts", "c.ts"],
   refs: { diff: REF, issue: null, changed_files: REF, rubricByLens: { correctness: REF, security: REF, "design-fit": REF, "test-adequacy": REF } },
-  lensMeta: { correctness: { model: "claude-opus-5", samples: 2 }, security: { model: "claude-opus-5", samples: 2 }, "design-fit": { model: "claude-opus-5", samples: 2 }, "test-adequacy": { model: "claude-opus-5", samples: 2 } },
+  lensMeta: {
+    correctness: { model: "claude-opus-5", samples: 2, title: "Correctness", needsIssueSpec: false },
+    security: { model: "claude-opus-5", samples: 2, title: "Security", needsIssueSpec: false },
+    "design-fit": { model: "claude-opus-5", samples: 2, title: "Design-fit", needsIssueSpec: true },
+    "test-adequacy": { model: "claude-opus-5", samples: 2, title: "Test-adequacy", needsIssueSpec: false },
+  },
 });
 
 test("every produced artifact validates (buildStageArtifacts self-asserts; re-check anyway)", () => {
@@ -72,6 +77,10 @@ test("detection: union deduped, partial agreement, severity/confidence counts", 
   assert.equal(d.output.samples_run, 2);
   assert.equal(d.output.samples_ok, 2);
   assert.equal(d.input.repo_commit, "deadbeef");
+  // self-contained replay params
+  assert.equal(d.input.model, "claude-opus-5");
+  assert.equal(d.input.title, "Correctness");
+  assert.equal(d.input.needs_issue_spec, false);
 });
 
 test("detection: a clean lens yields an empty union with identical agreement", () => {

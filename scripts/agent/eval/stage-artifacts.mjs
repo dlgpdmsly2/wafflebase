@@ -114,6 +114,11 @@ function checkDetection(art, errs) {
     if (inp.changed_files !== null && !isBlobRef(inp.changed_files)) errs.push("input.changed_files: BlobRef or null");
     if (!isRepoCommit(inp.repo_commit)) errs.push("input.repo_commit: commit string or null (diff-only)");
     if (!(Number.isInteger(inp.samples) && inp.samples >= 1)) errs.push("input.samples: integer ≥ 1");
+    // Lens replay params — so the fixture is SELF-CONTAINED for runLens (a lens's
+    // needs_issue_spec cannot be recovered from whether an issue blob is present).
+    if (!isNonEmptyString(inp.model)) errs.push("input.model: required non-empty string");
+    if (!isNonEmptyString(inp.title)) errs.push("input.title: required non-empty string (lens systemPrompt framing)");
+    if (typeof inp.needs_issue_spec !== "boolean") errs.push("input.needs_issue_spec: boolean");
   }
 
   if (!isObj(out)) { errs.push("output: required object for detection"); }

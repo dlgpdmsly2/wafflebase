@@ -37,7 +37,7 @@ export function itemContext({ store, version, runJson, snapshot, corpusInput, en
   const lensMeta = {};
   for (const l of snapshot.lenses ?? []) {
     rubricByLens[l.id] = store.putStageBlob(version, l.rubric_text ?? "");
-    lensMeta[l.id] = { model: l.model, samples: l.samples };
+    lensMeta[l.id] = { model: l.model, samples: l.samples, title: l.title, needsIssueSpec: l.needsIssueSpec };
   }
   return {
     item_id: envelope.item_id,

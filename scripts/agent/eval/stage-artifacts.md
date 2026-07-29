@@ -122,7 +122,10 @@ model actually emitted, not a normalized copy.
 "input": {
   "rubric": <BlobRef>, "diff": <BlobRef>,
   "issue": <BlobRef|null>, "changed_files": <BlobRef|null>,
-  "repo_commit": "<oid>|null", "samples": 2
+  "repo_commit": "<oid>|null", "samples": 2,
+  // lens replay params — so the fixture alone drives runLens (needs_issue_spec
+  // is NOT recoverable from whether an issue blob is present)
+  "model": "claude-opus-5", "title": "Correctness", "needs_issue_spec": false
 },
 "output": {
   "union": [<Finding>…],            // unionSamples() — coerced + deduped, kept-highest-severity
@@ -255,11 +258,12 @@ malformed fixture before it poisons a replay. It reports every problem as a
   the stage. `stage-run.mjs` (`runStage`) loops a stage's fixtures under a `run_id`
   (K replicates = K run_ids, resumable) and writes stage-run envelopes carrying
   `stage_id` + `fixture_ref`; the store gained `putStageRun`/`getStageRun`/
-  `listStageRun`/`listStageRunIds`. The **gate** adapter is implemented (pure →
-  free, deterministic; the gate determinism check). **DETECTION and VERIFIER
-  adapters land next** — they invoke the model, will reuse `review-panel.mjs`'s
-  `runLens`/`verifyFinding` on the materialized frozen input, and the verifier
-  needs `repo_commit` materialized (fidelity note, §4).
+  `listStageRun`/`listStageRunIds`. **All three adapters are implemented:** `gate`
+  (pure → free, deterministic — the gate determinism check), and `detection` /
+  `verifier`, which invoke the model by reusing `review-panel.mjs`'s exported
+  `runLens` / `verifyFinding` on the materialized frozen input (so the replayed
+  stage is byte-for-byte the shipped one). The verifier re-grounds from
+  `repo_commit`, so a diff-only replay is low-fidelity for it (§4).
 - **Per-stage metrics (task 5).** Group stage-run envelopes across `run_id`s by
   `fixture_ref`: binary flip-rate + Fleiss κ for verifier/gate; positive
   overlap/Jaccard for detection.

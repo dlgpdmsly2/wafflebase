@@ -457,7 +457,9 @@ export { withRetry };
 // what the panel actually grants; nothing else imports it.
 export const REVIEW_TOOLS = ["Read", "Grep", "Glob"];
 
-async function runLens(lens, { rubric, diff, issue, repo, sessionLog }) {
+// Exported so the Mode A detection-stage adapter replays the EXACT sampling call
+// against a frozen fixture, rather than a re-derived copy that could drift.
+export async function runLens(lens, { rubric, diff, issue, repo, sessionLog }) {
   const parts = [
     rubric,
     "",
@@ -490,7 +492,9 @@ async function runLens(lens, { rubric, diff, issue, repo, sessionLog }) {
 // verifier actually ran under, rather than a drifting hardcoded copy.
 export const VERIFIER_MAX_TURNS = 8;
 
-async function verifyFinding(finding, { rubric, repo, model, sessionLog, changedContext }) {
+// Exported so the Mode A verifier-stage adapter replays the EXACT refute call
+// against a frozen finding (see runLens above for the same rationale).
+export async function verifyFinding(finding, { rubric, repo, model, sessionLog, changedContext }) {
   // INDEPENDENCE — the point of this function. The verifier is deliberately NOT
   // given the diff. The lens that raised this finding reasoned from the diff, so
   // a verifier reading that same diff inherits its blind spots: a misread line

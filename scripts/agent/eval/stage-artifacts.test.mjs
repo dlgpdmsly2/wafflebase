@@ -24,7 +24,7 @@ function detection() {
   return {
     schema_version: STAGE_ARTIFACT_VERSION, item_id: "pr-521", stage: "detection",
     instance: { lens_id: "correctness" }, provenance: { ...PROV },
-    input: { rubric: { ...REF }, diff: { ...REF }, issue: null, changed_files: { ...REF }, repo_commit: "abc123", samples: 2 },
+    input: { rubric: { ...REF }, diff: { ...REF }, issue: null, changed_files: { ...REF }, repo_commit: "abc123", samples: 2, model: "claude-opus-5", title: "Correctness", needs_issue_spec: false },
     output: {
       union: [{ ...FINDING }], per_sample: [[{ ...FINDING }], [{ ...FINDING }]],
       samples_run: 2, samples_ok: 2, agreement: "identical",
@@ -149,6 +149,9 @@ test("detection: missing lens_id, bad BlobRef, samples<1, missing confidence_cou
   const d4 = detection(); delete d4.output.confidence_counts; hasErr(d4, "confidence_counts");
   const d5 = detection(); d5.output.agreement = "mostly"; hasErr(d5, "agreement");
   const d6 = detection(); d6.output.per_sample = [[{ severity: "major" }], "nope"]; hasErr(d6, "per_sample");
+  const d7 = detection(); delete d7.input.needs_issue_spec; hasErr(d7, "needs_issue_spec");
+  const d8 = detection(); d8.input.model = ""; hasErr(d8, "input.model");
+  const d9 = detection(); delete d9.input.title; hasErr(d9, "input.title");
 });
 
 // --- verifier-specific (the #573 shape) -------------------------------------

@@ -28,13 +28,33 @@
 // they will reuse review-panel.mjs's own `runLens` / `verifyFinding` on the
 // materialized frozen input so the replayed stage is byte-for-byte the shipped one.
 
+import { mkdtempSync, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { classify } from "../severity.mjs";
+import {
+  runLens, verifyFinding, withRetry, unionSamples, compareSampleAgreement,
+  severityCounts, confidenceCounts, changedFileContext, isDroppingVerdict,
+} from "../review-panel.mjs";
+import { materializeRepoAt } from "./run.mjs";
 
 /** Resolve a BlobRef (`{sha256,bytes}`) from a stage-fixtures version to its
  * content string — how prepareInput turns a frozen reference back into the diff /
  * rubric / issue / changed-files the stage consumed. null ref → null. */
 export function resolveBlobRef(store, version, ref) {
   return ref && ref.sha256 ? store.getStageBlob(version, ref.sha256) : null;
+}
+
+/** The working tree the stage runs against: the repo checked out at `repo_commit`
+ * (`materializeRepoAt`, cached), or a fresh EMPTY dir when unavailable — diff-only.
+ * Detection tolerates an empty dir (it has the diff); the independent VERIFIER
+ * Greps this tree, so diff-only starves it (a documented low-fidelity mode). */
+function resolveRepoDir({ repoSource, repoCache, repo_commit }) {
+  const ctx = repoCache ? materializeRepoAt({ repoSource, commit: repo_commit, cacheRoot: repoCache }) : null;
+  if (ctx?.path) return ctx.path;
+  const dir = path.join(mkdtempSync(path.join(tmpdir(), "stage-repo-")), "repo");
+  mkdirSync(dir, { recursive: true });
+  return dir;
 }
 
 /**
@@ -63,5 +83,98 @@ export const gateAdapter = {
   },
 };
 
-/** Stage → adapter registry. detection/verifier land next (they invoke the model). */
-export const STAGE_ADAPTERS = { gate: gateAdapter };
+/**
+ * Detection stage adapter — replays a lens's N-sample pass on the frozen diff.
+ * Reuses review-panel.mjs's own `runLens` (so the sampled call is byte-for-byte the
+ * shipped one) + `unionSamples` / `compareSampleAgreement`, and reports the SAME
+ * `detection.output` shape the capture produced. Cost = N model calls per fixture.
+ * If EVERY sample fails (e.g. a mid-replay quota outage) it throws, so the runner
+ * records an error envelope rather than a false "found nothing" (the same
+ * fail-closed rule the panel makes, and the reason infra failures must not read as
+ * clean reviews).
+ */
+export const detectionAdapter = {
+  stage_id: "detection",
+
+  prepareInput(fixture, { store, version, repoSource = null, repoCache = null }) {
+    const i = fixture.input;
+    return {
+      lens: { id: fixture.instance.lens_id, title: i.title, model: i.model, needsIssueSpec: i.needs_issue_spec },
+      rubric: resolveBlobRef(store, version, i.rubric) ?? "",
+      diff: resolveBlobRef(store, version, i.diff) ?? "",
+      issue: resolveBlobRef(store, version, i.issue),
+      repo: resolveRepoDir({ repoSource, repoCache, repo_commit: i.repo_commit }),
+      samples: Math.max(1, Number(i.samples) || 2),
+    };
+  },
+
+  async runReplica(prepared) {
+    const { lens, rubric, diff, issue, repo, samples } = prepared;
+    const sessionLog = [];
+    const results = await Promise.all(Array.from({ length: samples }, async () => {
+      try { return await withRetry(() => runLens(lens, { rubric, diff, issue, repo, sessionLog })); }
+      catch (e) { return { __error: e.message }; }
+    }));
+    const ok = results.filter((r) => r && !r.__error);
+    if (ok.length === 0) throw new Error((results[0] && results[0].__error) || "all detection samples failed");
+    const perSample = ok.map((r) => (Array.isArray(r.findings) ? r.findings : []));
+    const union = unionSamples(ok);
+    const output = {
+      union, per_sample: perSample, samples_run: samples, samples_ok: ok.length,
+      agreement: compareSampleAgreement(perSample),
+      severity_counts: severityCounts(union), confidence_counts: confidenceCounts(union),
+    };
+    return { output, sessionLog };
+  },
+};
+
+/**
+ * Verifier stage adapter — replays the independent refute pass on ONE frozen
+ * finding. Reuses `verifyFinding` (NOT given the diff — it re-grounds from the repo
+ * checked out at `repo_commit`) + `isDroppingVerdict`, so both the call and the
+ * drop rule are the shipped ones. The changed-file trust context is recomputed from
+ * the frozen `changed_files` blob via `changedFileContext`, reproducing the same
+ * `allowPreExisting` the capture used. An errored verdict KEEPS the finding
+ * (dropped=false) — the panel's fail-toward-blocking rule. Cost = 1 model call.
+ * (Fidelity note: diff-only replay — no `repo_commit` — starves this stage's Grep.)
+ */
+export const verifierAdapter = {
+  stage_id: "verifier",
+
+  prepareInput(fixture, { store, version, repoSource = null, repoCache = null }) {
+    const i = fixture.input;
+    const cfText = resolveBlobRef(store, version, i.changed_files);
+    const changedFiles = cfText ? cfText.split("\n").map((s) => s.trim()).filter(Boolean) : [];
+    return {
+      finding: i.finding,
+      rubric: resolveBlobRef(store, version, i.rubric) ?? "",
+      repo: resolveRepoDir({ repoSource, repoCache, repo_commit: i.repo_commit }),
+      model: i.model,
+      changedContext: changedFileContext(changedFiles),
+    };
+  },
+
+  async runReplica(prepared) {
+    const { finding, rubric, repo, model, changedContext } = prepared;
+    const sessionLog = [];
+    let verdict = null;
+    try { verdict = await withRetry(() => verifyFinding(finding, { rubric, repo, model, sessionLog, changedContext })); }
+    catch { verdict = null; } // error → keep the finding (fail toward blocking, as the panel does)
+    const dropped = isDroppingVerdict(verdict, { allowPreExisting: changedContext.authoritative });
+    const decided = verdict && typeof verdict === "object" && typeof verdict.verdict === "string";
+    const output = decided
+      ? {
+          decision: {
+            verdict: verdict.verdict, confidence: verdict.confidence, reason: verdict.reason ?? "",
+            refutationGround: verdict.refutationGround,
+            groundedIn: Array.isArray(verdict.groundedIn) ? verdict.groundedIn : [],
+          },
+          error: null, dropped,
+        }
+      : { decision: null, error: { message: "verifier produced no verdict (errored or no structured output)", kind: "no-verdict" }, dropped };
+    return { output, sessionLog };
+  },
+};
+
+/** Stage → adapter registry. */
+export const STAGE_ADAPTERS = { detection: detectionAdapter, verifier: verifierAdapter, gate: gateAdapter };

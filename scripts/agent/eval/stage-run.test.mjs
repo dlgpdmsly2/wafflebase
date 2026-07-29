@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { GitFsStore } from "./store.mjs";
-import { gateAdapter, resolveBlobRef, STAGE_ADAPTERS } from "./stage-adapters.mjs";
+import { gateAdapter, detectionAdapter, verifierAdapter, resolveBlobRef, STAGE_ADAPTERS } from "./stage-adapters.mjs";
 import { runStage } from "./stage-run.mjs";
 import { validateStageArtifact, stageInstanceKey } from "./stage-artifacts.mjs";
 
@@ -124,7 +124,58 @@ test("resolveBlobRef: BlobRef → content; null ref → null", () => {
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("STAGE_ADAPTERS registry exposes gate (detection/verifier land next)", () => {
+test("STAGE_ADAPTERS registry exposes all three stages", () => {
   assert.equal(STAGE_ADAPTERS.gate, gateAdapter);
-  assert.equal(STAGE_ADAPTERS.gate.stage_id, "gate");
+  assert.equal(STAGE_ADAPTERS.detection, detectionAdapter);
+  assert.equal(STAGE_ADAPTERS.verifier, verifierAdapter);
+  assert.deepEqual([STAGE_ADAPTERS.detection.stage_id, STAGE_ADAPTERS.verifier.stage_id, STAGE_ADAPTERS.gate.stage_id], ["detection", "verifier", "gate"]);
+});
+
+test("detectionAdapter.prepareInput: resolves frozen blobs → runLens inputs (free, no model)", () => {
+  const { store, root } = tmpStore();
+  try {
+    const rubric = store.putStageBlob("SV", "RUBRIC");
+    const diff = store.putStageBlob("SV", "DIFF");
+    const issue = store.putStageBlob("SV", "ISSUE");
+    const fx = {
+      schema_version: "stage-artifacts/v1", item_id: "pr-1", stage: "detection",
+      instance: { lens_id: "correctness" },
+      provenance: { run_id: "R", config_hash: "sha256:c", sdk_version: "0.3.217", captured_at: "T", model: "claude-opus-5" },
+      input: { rubric, diff, issue, changed_files: null, repo_commit: null, samples: 2, model: "claude-opus-5", title: "Correctness", needs_issue_spec: true },
+      output: {},
+    };
+    const p = detectionAdapter.prepareInput(fx, { store, version: "SV", repoSource: null, repoCache: null });
+    assert.equal(p.rubric, "RUBRIC");
+    assert.equal(p.diff, "DIFF");
+    assert.equal(p.issue, "ISSUE");
+    assert.equal(p.samples, 2);
+    assert.deepEqual(p.lens, { id: "correctness", title: "Correctness", model: "claude-opus-5", needsIssueSpec: true });
+    assert.equal(typeof p.repo, "string"); // an (empty) working-tree dir for diff-only
+    // a fixture with no issue blob → null issue
+    const p2 = detectionAdapter.prepareInput({ ...fx, input: { ...fx.input, issue: null } }, { store, version: "SV" });
+    assert.equal(p2.issue, null);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("verifierAdapter.prepareInput: recomputes trust context from the frozen changed-files blob", () => {
+  const { store, root } = tmpStore();
+  try {
+    const rubric = store.putStageBlob("SV", "RUBRIC");
+    const changed_files = store.putStageBlob("SV", "a.ts\nb.ts\n");
+    const finding = { severity: "major", confidence: "high", file: "a.ts", summary: "boom" };
+    const fx = {
+      schema_version: "stage-artifacts/v1", item_id: "pr-1", stage: "verifier",
+      instance: { lens_id: "correctness", population: "fresh", finding_key: "a.ts::boom" },
+      provenance: { run_id: "R", config_hash: "sha256:c", sdk_version: "0.3.217", captured_at: "T", model: "claude-opus-5" },
+      input: { finding, rubric, changed_files, changed_context: { authoritative: true, total: 2, listed_count: 2 }, repo_commit: null, model: "claude-opus-5", max_turns: 8 },
+      output: {},
+    };
+    const p = verifierAdapter.prepareInput(fx, { store, version: "SV", repoSource: null, repoCache: null });
+    assert.deepEqual(p.finding, finding);
+    assert.equal(p.rubric, "RUBRIC");
+    assert.equal(p.model, "claude-opus-5");
+    assert.equal(p.changedContext.authoritative, true); // 2 clean files → authoritative
+    assert.equal(p.changedContext.total, 2);
+    assert.equal(typeof p.repo, "string");
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

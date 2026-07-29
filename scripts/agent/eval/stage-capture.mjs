@@ -64,6 +64,8 @@ export function buildStageArtifacts(captured, ctx) {
       input: {
         rubric, diff: refs.diff, issue: refs.issue ?? null, changed_files: refs.changed_files ?? null,
         repo_commit, samples: meta.samples ?? samples.length,
+        // lens replay params → self-contained runLens replay
+        model: meta.model, title: meta.title, needs_issue_spec: !!meta.needsIssueSpec,
       },
       output: {
         union, per_sample: samples,
