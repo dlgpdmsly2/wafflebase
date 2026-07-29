@@ -240,9 +240,15 @@ malformed fixture before it poisons a replay. It reports every problem as a
     `compareSampleAgreement`, `changedFileContext`, `VERIFIER_MAX_TURNS`) so the union,
     agreement label, and trust context are computed by the exact code that ran — no
     re-derivation that could drift. It `assertStageArtifact`s every record.
-- **Fixture store (task 3).** Wire `buildStageArtifacts` into `run.mjs` at capture
-  time and harvest the results into `stage-fixtures/<version>`, keyed by
-  `stageInstanceKey`, deduping BlobRef blobs by `sha256`.
+- **Fixture store — DONE (task 3), OFFLINE.** Because the reviewer adapter already
+  stores `payload.stageDetail`, no `run.mjs` change is needed:
+  `extract-stage-fixtures.mjs` reads a captured run's stored items, rebuilds `ctx`
+  from the frozen corpus inputs + the run's config snapshot + envelope, calls
+  `buildStageArtifacts`, and harvests into `stage-fixtures/<version>` — artifacts
+  written write-once keyed by `stageInstanceKey`, inputs content-addressed into
+  `blobs/` (deduped by `sha256`). No model calls; only `status: "ok"` items are
+  harvested. Store surface: `putStageBlob`/`getStageBlob`,
+  `putStageArtifact`/`getStageArtifact`/`listStageArtifacts` on `GitFsStore`.
 - **Fixture store (task 3).** The extractor harvests each stage's frozen input into
   `stage-fixtures/<version>`, keyed by `stageInstanceKey`, deduping BlobRef blobs by
   `sha256`.

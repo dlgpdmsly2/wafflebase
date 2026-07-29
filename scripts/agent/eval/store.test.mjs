@@ -104,3 +104,32 @@ test("issueSpec omitted when empty; getLabels null when reserved", () => {
     assert.equal(store.getLabels("2026-07-28a", "pr-1"), null);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("stage blobs: content-addressed, deduped, round-trip", () => {
+  const { store, root } = tmpStore();
+  try {
+    const a = store.putStageBlob("V", "hello");
+    const b = store.putStageBlob("V", "hello"); // same content → same ref, one blob
+    assert.deepEqual(a, b);
+    assert.match(a.sha256, /^sha256:[0-9a-f]{64}$/);
+    assert.equal(a.bytes, 5);
+    assert.equal(store.getStageBlob("V", a.sha256), "hello");
+    const c = store.putStageBlob("V", "world");
+    assert.notEqual(c.sha256, a.sha256);
+    assert.equal(store.getStageBlob("V", "sha256:" + "0".repeat(64)), null);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("stage artifacts: write-once per key, get + list", () => {
+  const { store, root } = tmpStore();
+  try {
+    const art = { schema_version: "stage-artifacts/v1", item_id: "pr-1", stage: "gate", instance: {} };
+    store.putStageArtifact("V", "pr-1::gate", art);
+    store.putStageArtifact("V", "pr-1::gate", { ...art, item_id: "MUTATED" }); // immutable: ignored
+    assert.equal(store.getStageArtifact("V", "pr-1::gate").item_id, "pr-1");
+    store.putStageArtifact("V", "pr-1::detection::correctness", { ...art, stage: "detection" });
+    assert.equal(store.listStageArtifacts("V").length, 2);
+    assert.equal(store.getStageArtifact("V", "absent"), null);
+    assert.deepEqual(store.listStageArtifacts("EMPTY"), []);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

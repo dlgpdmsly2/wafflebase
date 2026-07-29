@@ -12,6 +12,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { gzipSync, gunzipSync } from "node:zlib";
+import { createHash } from "node:crypto";
 import path from "node:path";
 
 // Colon is legal in POSIX paths but not on all filesystems; keep segments safe
@@ -155,6 +156,54 @@ export class GitFsStore {
   getCorpus(corpusVersion) {
     const m = this._readJson(this._p("corpus", "manifests", `${safeSeg(corpusVersion)}.json`));
     return m ? (Array.isArray(m.items) ? m.items : []) : null;
+  }
+
+  // --- stage fixtures (Mode A: frozen per-stage inputs + captured decisions) --
+  // A `stage-fixtures/<version>` corpus of validated stage artifacts (see
+  // eval/stage-artifacts.md), harvested from a captured run by
+  // extract-stage-fixtures.mjs. Large inputs (diff/rubric/issue/changed-files) are
+  // content-addressed into blobs/ and referenced by BlobRef, so the many artifacts
+  // of one item share one diff blob. Keys are opaque here (item×stage×instance);
+  // the caller passes `stageInstanceKey(artifact)` — the store stays schema-agnostic.
+
+  _stageDir(version) { return this._p("stage-fixtures", safeSeg(version)); }
+
+  /** Content-address a stage input blob; write once (dedup across items/lenses);
+   * return its BlobRef `{sha256, bytes}`. sha256 == contentHash() format. */
+  putStageBlob(version, content) {
+    const s = String(content ?? "");
+    const sha256 = `sha256:${createHash("sha256").update(s, "utf8").digest("hex")}`;
+    const p = path.join(this._stageDir(version), "blobs", `${safeSeg(sha256)}.blob`);
+    if (!existsSync(p)) { mkdirSync(path.dirname(p), { recursive: true }); writeFileSync(p, s); }
+    return { sha256, bytes: Buffer.byteLength(s) };
+  }
+
+  getStageBlob(version, sha256) {
+    const p = path.join(this._stageDir(version), "blobs", `${safeSeg(sha256)}.blob`);
+    return existsSync(p) ? readFileSync(p, "utf8") : null;
+  }
+
+  _stageArtifactPath(version, key) {
+    const fname = createHash("sha256").update(String(key), "utf8").digest("hex");
+    return path.join(this._stageDir(version), "artifacts", `${fname}.json`);
+  }
+
+  /** Write-once per (item×stage×instance) `key`. Idempotent: a re-extraction of the
+   * same frozen input skips rather than throws (fixtures are immutable). Returns key. */
+  putStageArtifact(version, key, artifact) {
+    const p = this._stageArtifactPath(version, key);
+    if (!existsSync(p)) this._writeJson(p, artifact);
+    return key;
+  }
+
+  getStageArtifact(version, key) { return this._readJson(this._stageArtifactPath(version, key)); }
+
+  /** Every stage artifact for a version (scans artifacts/). */
+  listStageArtifacts(version) {
+    const dir = path.join(this._stageDir(version), "artifacts");
+    if (!existsSync(dir)) return [];
+    return readdirSync(dir).filter((f) => f.endsWith(".json")).sort()
+      .map((f) => this._readJson(path.join(dir, f)));
   }
 
   // --- labels (Track B — reserved) ------------------------------------------
