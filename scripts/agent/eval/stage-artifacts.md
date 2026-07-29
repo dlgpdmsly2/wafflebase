@@ -264,6 +264,10 @@ malformed fixture before it poisons a replay. It reports every problem as a
   `runLens` / `verifyFinding` on the materialized frozen input (so the replayed
   stage is byte-for-byte the shipped one). The verifier re-grounds from
   `repo_commit`, so a diff-only replay is low-fidelity for it (§4).
-- **Per-stage metrics (task 5).** Group stage-run envelopes across `run_id`s by
-  `fixture_ref`: binary flip-rate + Fleiss κ for verifier/gate; positive
-  overlap/Jaccard for detection.
+- **Per-stage metrics — DONE (task 5).** `stage-reliability.mjs` groups stage-run
+  envelopes across `run_id`s by `fixture_ref` and reports per stage: binary
+  flip-rate + Fleiss κ (reusing `reliability.mjs`'s `fleissKappaBinary`) for
+  gate (`block/approve`) and verifier (`drop/keep`); positive overlap (mean
+  pairwise Jaccard of union finding-key sets) for detection. Errored/no-output
+  replays are excluded, never laundered into the score. Written to
+  `stage-fixtures/<version>/scores/`.

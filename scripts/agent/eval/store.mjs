@@ -243,6 +243,14 @@ export class GitFsStore {
     return existsSync(dir) ? readdirSync(dir).sort() : [];
   }
 
+  /** Per-stage reliability score for a stage-fixtures version (re-scoreable). */
+  putStageScore(version, scorerId, scoreJson) {
+    this._writeJson(path.join(this._stageDir(version), "scores", `${safeSeg(scorerId)}.json`), scoreJson);
+  }
+  getStageScore(version, scorerId) {
+    return this._readJson(path.join(this._stageDir(version), "scores", `${safeSeg(scorerId)}.json`));
+  }
+
   // --- labels (Track B — reserved) ------------------------------------------
 
   getLabels(corpusVersion, itemId) {
