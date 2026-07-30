@@ -218,6 +218,30 @@ jobs:
             --config-id "${{ inputs.config_id }}" \
             --items "pr-${{ inputs.stage_pr }}" --run-id "stage-capture-${{ inputs.corpus_version }}" $FLAG
 
+      - name: Persist capture immediately (bank the spend before offline steps can fail)
+        if: ${{ inputs.push_results != 'false' }}
+        working-directory: ${{ github.workspace }}/eval-results
+        run: |
+          # The capture is the ONLY expensive step (a grounded panel run). The final
+          # push runs after harvest/replay/score, so ANY failure in those offline steps
+          # (e.g. a stage-schema drift throwing at harvest) skips the push and throws the
+          # capture away — you re-pay on the next dispatch. Bank it to the results repo
+          # the instant it succeeds; a re-dispatch with the same corpus_version then
+          # resumes against it via run.mjs's "already done, skip" instead of re-capturing.
+          git config user.name  "wafflebase-eval-bot"
+          git config user.email "wafflebase-eval-bot@users.noreply.github.com"
+          # Drop bulky raw transcripts now (harvest reads payload.json, not these) so the
+          # banked commit stays lean, same as the final step does.
+          find "$RESULTS_DIR/runs" -name 'transcript.json.gz' -delete || true
+          git add -A
+          if git diff --cached --quiet; then
+            echo "no capture changes to persist"; exit 0
+          fi
+          git commit -m "stage-pilot capture: $SV pr-${{ inputs.stage_pr }} (run ${{ github.run_id }})"
+          # Best-effort: a push race must NOT abort the run — the capture is already in the
+          # working tree, and the final push will carry it. Never regresses today's behaviour.
+          git push origin HEAD:main || echo "intermediate capture push failed (non-fatal); final push will retry"
+
       - name: Harvest stage fixtures (offline, no model calls)
         working-directory: scripts/agent
         run: |
