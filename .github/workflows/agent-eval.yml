@@ -53,6 +53,9 @@ on:
       stage_max_verifier:
         description: "stage-pilot only: cap verifier fixtures/item (bounds the O(findings)×K replay cost; 0 = uncapped)"
         default: "8"
+      stage_include_detection:
+        description: "stage-pilot only: also replay DETECTION (re-runs the FULL 5-lens panel per K — the pilot's biggest cost, ~$12/K). false = gate+verifier only (cheap, session-safe)"
+        default: "false"
       no_repo_context:
         description: "true = diff-only replay (skip repo checkout)"
         default: "false"
@@ -233,8 +236,15 @@ jobs:
           # review commit; gate is pure and ignores --repo-source. Diff-only starves
           # the verifier's Grep (low-fidelity), so keep repo context on when you can.
           [ "${{ inputs.no_repo_context }}" = "true" ] && REPO="" || REPO="--repo-source ${{ github.workspace }}"
+          # DETECTION replay re-runs the entire 5-lens × N-sample panel — a full review
+          # per K, the pilot's dominant cost (~$12/K). Off by default so a routine pilot
+          # is capture + gate + verifier (cheap, predictable, low session-limit risk);
+          # opt in only when you specifically want detection reliability. gate is free
+          # (pure) and verifier is capped, so those always run.
+          if [ "${{ inputs.stage_include_detection }}" = "true" ]; then STAGES="gate verifier detection"; else STAGES="gate verifier"; fi
+          echo "replaying stages: $STAGES (K=${{ inputs.stage_k }})"
           for k in $(seq 1 "${{ inputs.stage_k }}"); do
-            for stage in gate verifier detection; do
+            for stage in $STAGES; do
               echo "::group::stage=$stage k=$k"
               node eval/stage-run.mjs --out "$RESULTS_DIR" --stage-version "$SV" \
                 --stage "$stage" --run-id "${stage}-${k}" $REPO
@@ -245,7 +255,9 @@ jobs:
       - name: Score per-stage reliability
         working-directory: scripts/agent
         run: |
-          for stage in gate verifier detection; do
+          # Score only the stages actually replayed (detection is opt-in above).
+          if [ "${{ inputs.stage_include_detection }}" = "true" ]; then STAGES="gate verifier detection"; else STAGES="gate verifier"; fi
+          for stage in $STAGES; do
             echo "::group::score $stage"
             node eval/stage-reliability.mjs --out "$RESULTS_DIR" --stage-version "$SV" --stage "$stage" \
               || echo "  (need ≥2 usable replicates for $stage — skipped)"
