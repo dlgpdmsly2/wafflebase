@@ -204,10 +204,16 @@ jobs:
           # checkout aborts BEFORE spending — a silent diff-only capture over-flags,
           # exploding the verifier fan-out and cost (the #521 pilot billed $44 this way).
           if [ "${{ inputs.no_repo_context }}" = "true" ]; then FLAG="--no-repo-context"; else FLAG="--require-repo-context"; fi
+          # Namespace the capture run-id by corpus_version so a NEW corpus_version =
+          # a fresh capture. A fixed "stage-capture" id collides with a prior run's
+          # artifacts in the results repo, so the resume "already done, skip" reuses
+          # it — silently resurrecting a stale diff-only capture and bypassing the
+          # --require-repo-context guard entirely (which is exactly what happened
+          # re-dispatching the #521 pilot). Everything else is already corpus-scoped.
           node eval/run.mjs --out "$RESULTS_DIR" \
             --corpus-version "${{ inputs.corpus_version }}" \
             --config-id "${{ inputs.config_id }}" \
-            --items "pr-${{ inputs.stage_pr }}" --run-id stage-capture $FLAG
+            --items "pr-${{ inputs.stage_pr }}" --run-id "stage-capture-${{ inputs.corpus_version }}" $FLAG
 
       - name: Harvest stage fixtures (offline, no model calls)
         working-directory: scripts/agent
@@ -215,7 +221,7 @@ jobs:
           # Cap verifier fixtures/item so the K× replay cost is bounded regardless of
           # how many findings the capture raised (0 = uncapped).
           node eval/extract-stage-fixtures.mjs --out "$RESULTS_DIR" \
-            --run-id stage-capture --stage-version "$SV" \
+            --run-id "stage-capture-${{ inputs.corpus_version }}" --stage-version "$SV" \
             --max-verifier-fixtures "${{ inputs.stage_max_verifier }}"
 
       - name: Replay each stage K times
