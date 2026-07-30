@@ -74,6 +74,41 @@ test("extractItemFixtures: harvests det×2 + ver×1 + gate×1, all valid, blobs 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("detection input.diff is the lens's ROUTED slice when stage-detail carries lensDiff", () => {
+  const { store, root } = tmpStore();
+  try {
+    seed(store);
+    const corpusInput = store.getCorpusItemInput("pr-1");
+    const envelope = { item_id: "pr-1", status: "ok", timestamp: "2026-07-29T00:00:00.000Z" };
+    // Each lens saw a different routed slice of the full "DIFF" (per file-class routing).
+    const routed = payload();
+    routed.stageDetail.correctness.lensDiff = "DIFF@@a.ts-slice";
+    routed.stageDetail.security.lensDiff = "DIFF@@security-slice";
+    extractItemFixtures({ store, version: "SV", runJson, snapshot, corpusInput, envelope, payload: routed });
+
+    const stored = store.listStageArtifacts("SV");
+    const det = stored.find((a) => a.stage === "detection" && a.instance.lens_id === "correctness");
+    const secDet = stored.find((a) => a.stage === "detection" && a.instance.lens_id === "security");
+    // the frozen input is the lens's routed slice, NOT the full PR diff
+    assert.equal(store.getStageBlob("SV", det.input.diff.sha256), "DIFF@@a.ts-slice");
+    assert.equal(store.getStageBlob("SV", secDet.input.diff.sha256), "DIFF@@security-slice");
+    // distinct slices → distinct blobs (no accidental collapse to one diff)
+    assert.notEqual(det.input.diff.sha256, secDet.input.diff.sha256);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("detection input.diff falls back to the full diff when lensDiff is absent (old captures)", () => {
+  const { store, root } = tmpStore();
+  try {
+    seed(store);
+    const corpusInput = store.getCorpusItemInput("pr-1");
+    const envelope = { item_id: "pr-1", status: "ok", timestamp: "2026-07-29T00:00:00.000Z" };
+    extractItemFixtures({ store, version: "SV", runJson, snapshot, corpusInput, envelope, payload: payload() });
+    const det = store.listStageArtifacts("SV").find((a) => a.stage === "detection" && a.instance.lens_id === "correctness");
+    assert.equal(store.getStageBlob("SV", det.input.diff.sha256), "DIFF"); // full corpus diff
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 // A payload whose correctness lens raises THREE blocking findings → 3 verifier
 // fixtures, so the cap has something to trim.
 function verMany(f) { return { population: "fresh", finding: f, verdict: { verdict: "confirmed", confidence: "low", reason: "x", refutationGround: "none", groundedIn: [] }, dropped: false }; }

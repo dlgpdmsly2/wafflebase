@@ -88,6 +88,10 @@ export const gateAdapter = {
  * Reuses review-panel.mjs's own `runLens` (so the sampled call is byte-for-byte the
  * shipped one) + `unionSamples` / `compareSampleAgreement`, and reports the SAME
  * `detection.output` shape the capture produced. Cost = N model calls per fixture.
+ * The frozen `input.diff` is the lens's ROUTED slice (its scopeClasses subset, #582),
+ * not the whole PR — set by the capture from stage-detail.lensDiff — so the replay
+ * re-reviews exactly what the lens saw in production and pays only for that slice.
+ * (No `scopeNote` is threaded: the eval runs the panel in full mode, where it is "".)
  * If EVERY sample fails (e.g. a mid-replay quota outage) it throws, so the runner
  * records an error envelope rather than a false "found nothing" (the same
  * fail-closed rule the panel makes, and the reason infra failures must not read as

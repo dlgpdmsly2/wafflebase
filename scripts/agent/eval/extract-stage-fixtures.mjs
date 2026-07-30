@@ -28,7 +28,7 @@ import { stageInstanceKey } from "./stage-artifacts.mjs";
  * large input as a content blob (deduped) to get its BlobRef. Store-backed (the
  * blob writes are intrinsic to producing the refs).
  */
-export function itemContext({ store, version, runJson, snapshot, corpusInput, envelope }) {
+export function itemContext({ store, version, runJson, snapshot, corpusInput, envelope, payload }) {
   const diff = store.putStageBlob(version, corpusInput.diff ?? "");
   const issue = corpusInput.issueSpec ? store.putStageBlob(version, corpusInput.issueSpec) : null;
   // Canonical changed-files text = exactly what the panel was handed (join+trailing \n).
@@ -38,6 +38,15 @@ export function itemContext({ store, version, runJson, snapshot, corpusInput, en
   for (const l of snapshot.lenses ?? []) {
     rubricByLens[l.id] = store.putStageBlob(version, l.rubric_text ?? "");
     lensMeta[l.id] = { model: l.model, samples: l.samples, title: l.title, needsIssueSpec: l.needsIssueSpec };
+  }
+  // Per-lens ROUTED diff (the scopeClasses slice the panel actually fed each lens,
+  // recorded in stage-detail.lensDiff). Blobbed so the detection fixture's input.diff
+  // is that slice, not the full PR — the replay then re-reviews only what the lens saw
+  // (file-class routing #582), which is the detection-cost fix. Older captures lack
+  // lensDiff → the map is empty and buildStageArtifacts falls back to the full diff.
+  const routedDiffByLens = {};
+  for (const [lensId, detail] of Object.entries(payload?.stageDetail ?? {})) {
+    if (typeof detail?.lensDiff === "string") routedDiffByLens[lensId] = store.putStageBlob(version, detail.lensDiff);
   }
   return {
     item_id: envelope.item_id,
@@ -49,7 +58,7 @@ export function itemContext({ store, version, runJson, snapshot, corpusInput, en
     },
     repo_commit: corpusInput.meta?.review_commit ?? null,
     changed_files: corpusInput.changedFiles ?? [],
-    refs: { diff, issue, changed_files, rubricByLens },
+    refs: { diff, issue, changed_files, rubricByLens, routedDiffByLens },
     lensMeta,
   };
 }
@@ -63,7 +72,7 @@ export function itemContext({ store, version, runJson, snapshot, corpusInput, en
 export function extractItemFixtures({ store, version, runJson, snapshot, corpusInput, envelope, payload, maxVerifier }) {
   if (!envelope || envelope.status !== "ok") return { item_id: envelope?.item_id, skipped: true, reason: envelope?.status ?? "missing" };
   if (!payload) return { item_id: envelope.item_id, skipped: true, reason: "no-payload" };
-  const ctx = itemContext({ store, version, runJson, snapshot, corpusInput, envelope });
+  const ctx = itemContext({ store, version, runJson, snapshot, corpusInput, envelope, payload });
   let arts = buildStageArtifacts(payload, ctx);
 
   // Cost cap: the verifier stage is O(findings) — one fixture per blocking finding —

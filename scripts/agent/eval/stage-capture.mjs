@@ -54,6 +54,12 @@ export function buildStageArtifacts(captured, ctx) {
     const meta = lensMeta[lens] ?? {};
     const rubric = refs.rubricByLens?.[lens];
     const samples = Array.isArray(detail.samples) ? detail.samples : [];
+    // The lens reviewed its ROUTED slice (file-class routing #582), and the captured
+    // union/per_sample below are that slice's findings — so the fixture input must be
+    // that slice too, or the replay would feed the whole PR and diverge from the
+    // baseline it's scored against. Fall back to the full diff for older captures that
+    // predate stage-detail.lensDiff (routedDiffByLens has no entry for the lens).
+    const lensDiffRef = refs.routedDiffByLens?.[lens] ?? refs.diff;
 
     // --- detection ---
     const union = unionSamples(samples.map((findings) => ({ findings })));
@@ -62,7 +68,7 @@ export function buildStageArtifacts(captured, ctx) {
       instance: { lens_id: lens },
       provenance: { ...provBase, model: meta.model },
       input: {
-        rubric, diff: refs.diff, issue: refs.issue ?? null, changed_files: refs.changed_files ?? null,
+        rubric, diff: lensDiffRef, issue: refs.issue ?? null, changed_files: refs.changed_files ?? null,
         repo_commit, samples: meta.samples ?? samples.length,
         // lens replay params → self-contained runLens replay
         model: meta.model, title: meta.title, needs_issue_spec: !!meta.needsIssueSpec,

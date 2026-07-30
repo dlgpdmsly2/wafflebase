@@ -1471,7 +1471,15 @@ async function main() {
     mkdirSync(lensOut, { recursive: true });
     writeFileSync(
       path.join(lensOut, "stage-detail.json"),
-      JSON.stringify({ samples: (ok ?? []).map((r) => (Array.isArray(r.findings) ? r.findings : [])), verifications }) + "\n",
+      // `lensDiff` is the ROUTED slice this lens actually reviewed (its scopeClasses
+      // subset of the PR, per file-class routing #582) — NOT the full PR diff. The
+      // offline detection replay reads it so each lens re-reviews exactly what it saw
+      // in production; that is also why the replay is CHEAP (a lens re-reads its slice,
+      // not the whole PR). Absent this, the capture stored the full diff and the replay
+      // fed every lens everything — both a fidelity gap and the detection cost whale.
+      // (`scopeNote` is the incremental-scope prompt addendum, "" in the full mode the
+      // eval runs; recorded for a future incremental-mode replay.)
+      JSON.stringify({ lensDiff, scopeNote, samples: (ok ?? []).map((r) => (Array.isArray(r.findings) ? r.findings : [])), verifications }) + "\n",
     );
 
     // What the LENS CHECK gates on: `merged` minus the demoted blockers. The
