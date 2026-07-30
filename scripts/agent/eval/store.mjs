@@ -251,9 +251,61 @@ export class GitFsStore {
     return this._readJson(path.join(this._stageDir(version), "scores", `${safeSeg(scorerId)}.json`));
   }
 
-  // --- labels (Track B — reserved) ------------------------------------------
+  // --- labels (Track B — validity ground truth) -----------------------------
+  // Two records under labels/<corpusVersion>/ (see labeled-dataset-validity
+  // overview §5.1): item-level truth (verdict_label, true_defects) at
+  // <itemId>.json, and finding-level truth (is_real, should_verifier_keep) at
+  // findings/<itemId>/<sha256(finding_key)>.json. Finding labels are keyed by the
+  // panel's own findingKey (file::lowercased-summary) so a label joins directly
+  // onto a detection-union entry / verifier artifact with no fuzzy matching.
+  //
+  // Unlike runs/ (write-once immutable observations), labels are human-authored
+  // truth and are correctable — put overwrites. Drift is handled at read time by
+  // labelStatus() via diff_sha256, not by refusing writes.
 
-  getLabels(corpusVersion, itemId) {
-    return this._readJson(this._p("labels", safeSeg(corpusVersion), `${safeSeg(itemId)}.json`));
+  _labelDir(corpusVersion) { return this._p("labels", safeSeg(corpusVersion)); }
+  _itemLabelPath(corpusVersion, itemId) {
+    return path.join(this._labelDir(corpusVersion), `${safeSeg(itemId)}.json`);
+  }
+  _findingLabelPath(corpusVersion, itemId, findingKey) {
+    const fname = createHash("sha256").update(String(findingKey), "utf8").digest("hex");
+    return path.join(this._labelDir(corpusVersion), "findings", safeSeg(itemId), `${fname}.json`);
+  }
+
+  /** Item-level label (overwrites — re-labelling a corrected verdict is normal). */
+  putLabels(corpusVersion, itemId, label) {
+    this._writeJson(this._itemLabelPath(corpusVersion, itemId), label);
+  }
+  getLabels(corpusVersion, itemId) { return this._readJson(this._itemLabelPath(corpusVersion, itemId)); }
+
+  /** Finding-level label, keyed by the panel's findingKey. The key is stamped
+   * into the stored record so a listFindingLabels() consumer recovers it (the
+   * on-disk filename is the hash, not the readable key). Overwrites. */
+  putFindingLabel(corpusVersion, itemId, findingKey, label) {
+    this._writeJson(this._findingLabelPath(corpusVersion, itemId, findingKey), { finding_key: findingKey, ...label });
+  }
+  getFindingLabel(corpusVersion, itemId, findingKey) {
+    return this._readJson(this._findingLabelPath(corpusVersion, itemId, findingKey));
+  }
+  /** All finding labels for one item (the verifier/detection scorers join over these). */
+  listFindingLabels(corpusVersion, itemId) {
+    const dir = path.join(this._labelDir(corpusVersion), "findings", safeSeg(itemId));
+    if (!existsSync(dir)) return [];
+    return readdirSync(dir).filter((f) => f.endsWith(".json")).sort()
+      .map((f) => this._readJson(path.join(dir, f)));
+  }
+
+  /** Drift-guarded lifecycle: "unlabeled" | "labeled" | "stale". A label is stale
+   * when the item's diff changed since it was written (its diff_sha256 no longer
+   * matches the corpus item), so a validity scorer drops it rather than scoring
+   * against a diff that no longer exists. Missing hashes on either side → not stale
+   * (can't prove drift; caller may pass the corpus item's sha256_diff). */
+  labelStatus(corpusVersion, itemId, currentDiffSha256) {
+    const label = this.getLabels(corpusVersion, itemId);
+    if (!label) return "unlabeled";
+    if (currentDiffSha256 != null && label.diff_sha256 != null && label.diff_sha256 !== currentDiffSha256) {
+      return "stale";
+    }
+    return "labeled";
   }
 }

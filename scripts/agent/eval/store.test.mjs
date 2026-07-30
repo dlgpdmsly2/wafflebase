@@ -96,12 +96,61 @@ test("putConfig/getConfig round-trips; missing → null", () => {
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("issueSpec omitted when empty; getLabels null when reserved", () => {
+test("issueSpec omitted when empty; getLabels null when unlabeled", () => {
   const { store, root } = tmpStore();
   try {
     store.putCorpusItem("pr-1", { meta: { id: "pr-1" }, diff: "x", changedFiles: [], issueSpec: "" });
     assert.equal(store.getCorpusItemInput("pr-1").issueSpec, null);
     assert.equal(store.getLabels("2026-07-28a", "pr-1"), null);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("item labels round-trip and overwrite (re-labelling allowed)", () => {
+  const { store, root } = tmpStore();
+  try {
+    assert.equal(store.getLabels("v1", "pr-521"), null);
+    store.putLabels("v1", "pr-521", { verdict_label: "block", diff_sha256: "sha256:aaa", label_source: "gold" });
+    assert.equal(store.getLabels("v1", "pr-521").verdict_label, "block");
+    // corrected re-label overwrites (labels are truth, not write-once observations)
+    store.putLabels("v1", "pr-521", { verdict_label: "approve", diff_sha256: "sha256:aaa", label_source: "gold" });
+    assert.equal(store.getLabels("v1", "pr-521").verdict_label, "approve");
+    // keyed by (corpusVersion, itemId): a different version is a distinct record
+    assert.equal(store.getLabels("v2", "pr-521"), null);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("finding labels: keyed by findingKey, stamp the key, list per item", () => {
+  const { store, root } = tmpStore();
+  try {
+    const k1 = "packages/x/y.ts::missing null guard";
+    const k2 = "packages/x/y.ts::unrelated nit";
+    assert.equal(store.getFindingLabel("v1", "pr-521", k1), null);
+    store.putFindingLabel("v1", "pr-521", k1, { is_real: true, should_verifier_keep: true, severity: "major" });
+    store.putFindingLabel("v1", "pr-521", k2, { is_real: false, should_verifier_keep: false, severity: "nit" });
+    const got = store.getFindingLabel("v1", "pr-521", k1);
+    assert.equal(got.is_real, true);
+    assert.equal(got.finding_key, k1);                 // key stamped into the record
+    // overwrite (re-adjudication) allowed
+    store.putFindingLabel("v1", "pr-521", k1, { is_real: false, should_verifier_keep: false });
+    assert.equal(store.getFindingLabel("v1", "pr-521", k1).is_real, false);
+    const all = store.listFindingLabels("v1", "pr-521");
+    assert.equal(all.length, 2);
+    assert.deepEqual(all.map((l) => l.finding_key).sort(), [k1, k2].sort());
+    assert.deepEqual(store.listFindingLabels("v1", "unlabeled-item"), []);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("labelStatus: unlabeled → labeled → stale on diff drift", () => {
+  const { store, root } = tmpStore();
+  try {
+    assert.equal(store.labelStatus("v1", "pr-1", "sha256:aaa"), "unlabeled");
+    store.putLabels("v1", "pr-1", { verdict_label: "block", diff_sha256: "sha256:aaa" });
+    assert.equal(store.labelStatus("v1", "pr-1", "sha256:aaa"), "labeled");
+    assert.equal(store.labelStatus("v1", "pr-1", "sha256:bbb"), "stale"); // re-extracted diff changed
+    // can't prove drift when either hash is absent → not stale
+    assert.equal(store.labelStatus("v1", "pr-1", null), "labeled");
+    store.putLabels("v1", "pr-2", { verdict_label: "approve" });          // label without diff_sha256
+    assert.equal(store.labelStatus("v1", "pr-2", "sha256:zzz"), "labeled");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
