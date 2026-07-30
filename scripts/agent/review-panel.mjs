@@ -108,7 +108,7 @@ const LENS_SCHEMA = {
 // decide. Both are required by `isDroppingVerdict` before a finding can be
 // dropped — turning "only refute with a concrete reason" from prose in the
 // prompt into a shape the trusted script can check.
-const VERIFIER_SCHEMA = {
+export const VERIFIER_SCHEMA = {
   type: "object",
   properties: {
     // `unresolved` exists so "I could not settle this" stops being reported as

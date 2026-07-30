@@ -181,6 +181,33 @@ test("verifier: decision requires refutationGround (enum) + groundedIn (string[]
   const v5 = verifier(); v5.output.decision.verdict = "maybe"; hasErr(v5, "verdict");
 });
 
+test("verifier: accepts the full pipeline verdict/ground vocabulary (unresolved, counterexample)", () => {
+  // Regression: these values were emitted by the shipped verifier (#587) but the
+  // stage schema hand-copied only confirmed|refuted and 5 grounds, so the harvest
+  // threw AFTER a paid capture. The enums now derive from VERIFIER_SCHEMA, so they
+  // must accept every value the pipeline can produce.
+  const unres = verifier();
+  unres.output.decision = { verdict: "unresolved", confidence: "low", reason: "could not settle", refutationGround: "none", groundedIn: [] };
+  ok(unres);
+  const cex = verifier();
+  cex.output.decision = { verdict: "refuted", confidence: "high", reason: "found one", refutationGround: "counterexample", groundedIn: ["packages/x/y.ts:9"] };
+  ok(cex);
+});
+
+// The stage schema is a PROJECTION of the verifier's structured_output, so its
+// accepted vocabulary must equal the pipeline's. Assert the derivation holds (and
+// would fail loudly HERE — before a dispatch spends money — if the two drift).
+test("verifier enums stay coupled to review-panel's VERIFIER_SCHEMA", async () => {
+  const { VERIFIER_SCHEMA } = await import("../review-panel.mjs");
+  const { VERIFIER_VERDICTS, VERIFIER_CONFIDENCE, REFUTATION_GROUNDS } = await import("./stage-artifacts.mjs");
+  assert.deepEqual(VERIFIER_VERDICTS, VERIFIER_SCHEMA.properties.verdict.enum);
+  assert.deepEqual(VERIFIER_CONFIDENCE, VERIFIER_SCHEMA.properties.confidence.enum);
+  assert.deepEqual(REFUTATION_GROUNDS, VERIFIER_SCHEMA.properties.refutationGround.enum);
+  // and the specific values that bit us are present
+  assert.ok(VERIFIER_VERDICTS.includes("unresolved"));
+  assert.ok(REFUTATION_GROUNDS.includes("counterexample"));
+});
+
 test("verifier: exactly one of {decision, error}; dropped must be boolean", () => {
   const both = verifier(); both.output.error = { message: "x" }; hasErr(both, "exactly one of");
   const neither = verifier(); neither.output = { decision: null, error: null, dropped: false }; hasErr(neither, "exactly one of");

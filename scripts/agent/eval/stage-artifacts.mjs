@@ -28,6 +28,7 @@
 // Pure (no fs/SDK/clock); exported for reuse by the extractor, adapters, and tests.
 
 import { KNOWN } from "../severity.mjs";
+import { VERIFIER_SCHEMA } from "../review-panel.mjs";
 
 export const STAGE_ARTIFACT_VERSION = "stage-artifacts/v1";
 
@@ -38,12 +39,17 @@ export const RESERVED_STAGES = ["rebuttal", "adjudicator"];
 
 export const POPULATIONS = ["fresh", "prior-round"];          // verifier finding source
 export const AGREEMENT = ["single", "identical", "partial", "disjoint"]; // compareSampleAgreement
-export const VERIFIER_VERDICTS = ["confirmed", "refuted"];
-export const VERIFIER_CONFIDENCE = ["high", "low"];
-// The closed set of ways a verifier may ground a refutation (VERIFIER_SCHEMA in
-// review-panel.mjs). `none` = did not refute; every other value + a file:line
-// citation is what `isDroppingVerdict` requires before a finding may be dropped.
-export const REFUTATION_GROUNDS = ["not-present", "already-guarded", "out-of-scope", "pre-existing", "none"];
+// DERIVED from the pipeline's own VERIFIER_SCHEMA, never re-typed. The capture is a
+// projection of the verifier's structured_output, so its accepted vocabulary must BE
+// the verifier's — a hand-maintained copy drifts (and did: it lacked `unresolved` and
+// `counterexample`, which failed the harvest AFTER a paid capture). Sourcing them from
+// the schema makes that class of failure impossible; stage-artifacts.test.mjs asserts
+// the coupling so the intent is visible. Verdict adds `unresolved` (#587: "couldn't
+// settle"); refutationGround adds `counterexample` (#587: refute an absence claim by
+// finding an example).
+export const VERIFIER_VERDICTS = VERIFIER_SCHEMA.properties.verdict.enum;
+export const VERIFIER_CONFIDENCE = VERIFIER_SCHEMA.properties.confidence.enum;
+export const REFUTATION_GROUNDS = VERIFIER_SCHEMA.properties.refutationGround.enum;
 export const GATE_VERDICTS = ["block", "approve"];
 export const LENS_CONCLUSIONS = ["success", "failure", "skipped"];
 export const SEVERITIES = KNOWN;                              // critical|major|minor|nit
