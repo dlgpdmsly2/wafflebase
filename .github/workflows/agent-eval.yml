@@ -8,7 +8,7 @@
 # (when push_results is on) AND (b) uploaded as a downloadable artifact (always, a
 # backup that survives even if the push is misconfigured).
 #
-# Two modes (pick with the `mode` input; a dispatch runs exactly one):
+# Three modes (pick with the `mode` input; a dispatch runs exactly one):
 #   reliability  — whole-panel: K replicate panel runs → verdict flip-rate + κ.
 #   stage-pilot  — Mode A: capture ONE item once, then replay each STAGE
 #                  (gate/verifier/detection) K times → per-stage flip-rate/κ/overlap.
@@ -16,6 +16,17 @@
 #                  PR commits aren't fetchable in the fork CI it falls back to
 #                  diff-only, which makes the verifier metric low-fidelity — see the
 #                  no_repo_context note.
+#   validity     — VALIDITY (is the panel right?), the counterpart to reliability's
+#                  (is it stable?). Lightweight + MODEL-FREE: no extract, no panel
+#                  run, no capture — it only re-scores stage fixtures a prior
+#                  stage-pilot already produced AGAINST ground-truth labels, so it
+#                  costs a runner-minute and zero model budget. Reads two things from
+#                  the eval repo, keyed by corpus_version:
+#                    - stage-fixtures/<corpus_version>__stagepilot/  (from stage-pilot)
+#                    - labels/<corpus_version>/findings/…            (the labeled
+#                      dataset — finding-level is_real, human-committed). THAT labels/
+#                      tree IS the dataset: feed new labels by committing them there.
+#                  Runs verifier-validity.mjs → keep/drop × real/fake confusion matrix.
 #
 # One-time setup — two repo secrets on THIS repo (the wafflebase fork, where the
 # workflow runs):
@@ -30,7 +41,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "reliability (whole-panel) | stage-pilot (Mode A stage isolation)"
+        description: "reliability (whole-panel) | stage-pilot (Mode A stage isolation) | validity (model-free re-score vs labels)"
         default: "reliability"
       corpus_version:
         description: "corpus version (rebuilt fresh from the PRs below)"
@@ -310,4 +321,75 @@ jobs:
         with:
           name: stage-pilot-${{ inputs.corpus_version }}-pr${{ inputs.stage_pr }}-K${{ inputs.stage_k }}
           path: ${{ env.RESULTS_DIR }}
+          retention-days: 30
+
+  # validity — lightweight, MODEL-FREE re-score of an existing stage-fixtures corpus
+  # against committed ground-truth labels. No corpus extract, no panel run, no
+  # capture: it reads fixtures + labels already in the eval repo and runs the
+  # validity scorer(s), so a dispatch is a runner-minute and $0 of model budget.
+  # Prereqs in the eval repo (both keyed by corpus_version): the stage fixtures from a
+  # prior stage-pilot AND the finding-level labels a human committed under labels/.
+  validity:
+    if: ${{ inputs.mode == 'validity' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RESULTS_DIR: ${{ github.workspace }}/eval-results
+      # Fixtures a stage-pilot writes are named <corpus_version>__stagepilot; score
+      # that corpus. (Same derivation as stage-pilot's SV, so the two modes couple by
+      # a shared corpus_version with no extra input.)
+      SV: ${{ inputs.corpus_version }}__stagepilot
+    steps:
+      - uses: actions/checkout@v4          # the harness — the validity scorer lives here
+
+      # The eval repo carries BOTH the fixtures to score and the labels to score
+      # against, so validity MUST check it out (unconditionally — unlike the
+      # generating modes, which only need it to push results back out).
+      - name: Checkout eval results repo (fixtures + labels)
+        uses: actions/checkout@v4
+        with:
+          repository: dlgpdmsly2/wafflebase-agent-eval
+          token: ${{ secrets.EVAL_REPO_TOKEN }}
+          path: eval-results
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # No `npm ci`: the validity scorers are pure Node (fs/crypto/path only, via
+      # store.mjs) — no SDK, no dependencies. This is what keeps the mode lightweight.
+
+      - name: Score verifier-stage validity (re-score; no model calls)
+        working-directory: scripts/agent
+        run: |
+          echo "scoring stage-version=$SV corpus-version=${{ inputs.corpus_version }}"
+          # Exits non-zero if the fixtures version has no verifier artifacts (wrong
+          # corpus_version / no stage-pilot yet); n=0 with all findings unlabeled is a
+          # clean "no-data" (labels missing or key-mismatch), reported not failed.
+          node eval/verifier-validity.mjs --out "$RESULTS_DIR" \
+            --stage-version "$SV" --corpus-version "${{ inputs.corpus_version }}"
+
+      - name: Commit & push validity score to eval repo
+        if: ${{ inputs.push_results != 'false' }}
+        working-directory: ${{ github.workspace }}/eval-results
+        run: |
+          git config user.name  "wafflebase-eval-bot"
+          git config user.email "wafflebase-eval-bot@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "no score changes to commit"; exit 0
+          fi
+          git commit -m "validity: $SV — verifier-validity (run ${{ github.run_id }})"
+          # A re-score races the generating modes' pushes to main; rebase first so a
+          # concurrent results push doesn't reject this idempotent score.
+          git pull --rebase origin main
+          git push origin HEAD:main
+
+      - name: Upload validity score (backup artifact)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: validity-${{ inputs.corpus_version }}
+          path: ${{ env.RESULTS_DIR }}/stage-fixtures/${{ inputs.corpus_version }}__stagepilot/scores
           retention-days: 30
