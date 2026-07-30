@@ -84,3 +84,24 @@ test("computeStageReliability: <2 runs → note, no crash", () => {
   assert.equal(r.aggregate.k_runs, 1);
   assert.match(r.aggregate.note, /need/);
 });
+
+test("computeStageReliability: nothing scorable → null, NOT a passing 0/1.0", () => {
+  // Every fixture errored in one run (the #521 pilot shape: detection-2 all 429'd).
+  const binRuns = [
+    { runId: "r1", decisions: { f1: "block", f2: "block" } },
+    { runId: "r2", decisions: { f1: null, f2: null } },
+  ];
+  const g = computeStageReliability("gate", binRuns);
+  assert.equal(g.aggregate.n, 0);
+  assert.equal(g.aggregate.flip_rate, null);   // not 0 — 0 would read as "stable"
+  assert.match(g.aggregate.note, /no data/);
+
+  const detRuns = [
+    { runId: "r1", decisions: { f1: ["a::x"] } },
+    { runId: "r2", decisions: { f1: null } },
+  ];
+  const d = computeStageReliability("detection", detRuns);
+  assert.equal(d.aggregate.n, 0);
+  assert.equal(d.aggregate.mean_jaccard, null); // not 1.0 — 1.0 would read as "perfect"
+  assert.match(d.aggregate.note, /no data/);
+});

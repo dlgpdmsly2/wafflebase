@@ -77,7 +77,14 @@ export function computeStageReliability(stage, runs) {
     return {
       stage, method: "positive overlap — mean pairwise Jaccard of union finding-key sets",
       per_fixture,
-      aggregate: { n: common.length, k_runs: K, items_excluded: excluded, mean_jaccard: common.length ? jsum / common.length : 1 },
+      // No common fixtures = NO DATA, not perfect agreement. Report null (+ a note)
+      // so an all-excluded run — e.g. the #521 pilot where one detection replay 429'd
+      // — never masquerades as mean_jaccard 1.0.
+      aggregate: {
+        n: common.length, k_runs: K, items_excluded: excluded,
+        mean_jaccard: common.length ? jsum / common.length : null,
+        ...(common.length ? {} : { note: "no fixture scorable in all K runs — no data" }),
+      },
     };
   }
 
@@ -98,7 +105,13 @@ export function computeStageReliability(stage, runs) {
   return {
     stage, method: `Fleiss κ over replicate binary ${stage} decision (${A}/${B})`,
     per_fixture,
-    aggregate: { n: common.length, k_runs: K, items_excluded: excluded, flip_rate: common.length ? unstable / common.length : 0, kappa: fleissKappaBinary(counts) },
+    aggregate: {
+      n: common.length, k_runs: K, items_excluded: excluded,
+      // null (not 0) when nothing was scorable — 0 flip-rate would read as "stable".
+      flip_rate: common.length ? unstable / common.length : null,
+      kappa: fleissKappaBinary(counts),
+      ...(common.length ? {} : { note: "no fixture scorable in all K runs — no data" }),
+    },
   };
 }
 

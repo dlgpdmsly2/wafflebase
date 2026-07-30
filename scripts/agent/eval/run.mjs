@@ -47,9 +47,14 @@ export function materializeRepoAt({ repoSource, commit, cacheRoot }) {
     const files = countFiles(dest);
     writeFileSync(mark, `${commit} ${files}\n`);
     return { path: dest, files };
-  } catch {
+  } catch (e) {
     rmSync(dest, { recursive: true, force: true });
-    return null; // commit not fetched / archive failed → diff-only fallback
+    // Commit not fetched / archive failed → diff-only fallback. Surface WHY (git's
+    // stderr) instead of swallowing it — a silent 0-file checkout is exactly how the
+    // #521 pilot billed a full diff-only run without anyone noticing. Return the
+    // reason so the caller can log it (still null-shaped for the fallback contract).
+    const why = (e.stderr?.toString?.() || e.message || "").split("\n").find((l) => l.trim()) || "unknown";
+    return { path: null, files: 0, error: why };
   }
 }
 
@@ -116,6 +121,9 @@ async function main() {
   // repo). --no-repo-context forces diff-only replay (empty --repo).
   const repoSource = args["no-repo-context"] ? null : path.resolve(args["repo-source"] ?? path.join(HERE, "..", ".."));
   const repoCache = path.join(tmpdir(), "eval-repo-cache");
+  // Abort (per item, before any model call) if the repo tree can't be checked out —
+  // a diff-only run is a fidelity + cost trap, not a silent fallback. See the guard below.
+  const requireRepoContext = !!args["require-repo-context"];
 
   const { manifest, snapshot, config_hash } = buildConfig(lensesDir, {
     configId, sdkVersion, description: args.description ?? "",
@@ -156,7 +164,28 @@ async function main() {
     const ctx = materializeRepoAt({ repoSource, commit: input.meta?.review_commit, cacheRoot: repoCache });
     const repoDir = ctx?.path ?? path.join(workDir, "repo");
     const contextFiles = ctx?.files ?? 0; // 0 = diff-only (context unavailable)
-    if (repoSource) process.stdout.write(`  → ${itemId}: repo context = ${contextFiles ? `${contextFiles} files` : "DIFF-ONLY (unavailable)"}\n`);
+    if (repoSource) process.stdout.write(`  → ${itemId}: repo context = ${contextFiles ? `${contextFiles} files` : `DIFF-ONLY (unavailable${ctx?.error ? `: ${ctx.error}` : ""})`}\n`);
+
+    // Hard guard: a diff-only review over-flags (ungrounded lenses can't clear
+    // speculative findings), which explodes the verifier fan-out and cost — the #521
+    // pilot billed $44 this way. When --require-repo-context is set, refuse to spend
+    // on a 0-file checkout: record an error item (no model calls) and move on.
+    if (requireRepoContext && contextFiles === 0 && !args["no-repo-context"]) {
+      const msg = `repo context required but unavailable for ${itemId} (commit ${String(input.meta?.review_commit).slice(0, 12)}${ctx?.error ? `: ${ctx.error}` : ""})`;
+      store.putItem(runId, itemId, {
+        envelope: {
+          run_id: runId, item_id: itemId, config_hash, corpus_version: corpusVersion,
+          status: "error", reason: "no-repo-context", cost_usd: 0, weighted_tokens: 0, raw_tokens: 0,
+          duration_ms: 0, turns: 0, calls: 0, repo_context_files: 0, timestamp: nowIso(),
+          payload_ref: "payload.json", transcript_ref: "transcript.json.gz",
+          error: { message: msg, kind: "no-repo-context" },
+        },
+        payload: { adapter: "reviewer", error: msg },
+        transcript: null,
+      });
+      console.error(`  ! ${itemId}: SKIPPED — ${msg}`);
+      continue;
+    }
 
     let envelope, payload, transcript;
     try {

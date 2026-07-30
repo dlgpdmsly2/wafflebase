@@ -50,6 +50,9 @@ on:
       stage_k:
         description: "stage-pilot only: K stage replicates per stage (≥2 for flip-rate/κ)"
         default: "2"
+      stage_max_verifier:
+        description: "stage-pilot only: cap verifier fixtures/item (bounds the O(findings)×K replay cost; 0 = uncapped)"
+        default: "8"
       no_repo_context:
         description: "true = diff-only replay (skip repo checkout)"
         default: "false"
@@ -197,7 +200,10 @@ jobs:
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
-          [ "${{ inputs.no_repo_context }}" = "true" ] && FLAG="--no-repo-context" || FLAG=""
+          # Diff-only is opt-in. Otherwise REQUIRE repo context so a failed PR-commit
+          # checkout aborts BEFORE spending — a silent diff-only capture over-flags,
+          # exploding the verifier fan-out and cost (the #521 pilot billed $44 this way).
+          if [ "${{ inputs.no_repo_context }}" = "true" ]; then FLAG="--no-repo-context"; else FLAG="--require-repo-context"; fi
           node eval/run.mjs --out "$RESULTS_DIR" \
             --corpus-version "${{ inputs.corpus_version }}" \
             --config-id "${{ inputs.config_id }}" \
@@ -206,8 +212,11 @@ jobs:
       - name: Harvest stage fixtures (offline, no model calls)
         working-directory: scripts/agent
         run: |
+          # Cap verifier fixtures/item so the K× replay cost is bounded regardless of
+          # how many findings the capture raised (0 = uncapped).
           node eval/extract-stage-fixtures.mjs --out "$RESULTS_DIR" \
-            --run-id stage-capture --stage-version "$SV"
+            --run-id stage-capture --stage-version "$SV" \
+            --max-verifier-fixtures "${{ inputs.stage_max_verifier }}"
 
       - name: Replay each stage K times
         working-directory: scripts/agent

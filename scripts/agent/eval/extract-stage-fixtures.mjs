@@ -60,17 +60,33 @@ export function itemContext({ store, version, runJson, snapshot, corpusInput, en
  * payload. buildStageArtifacts asserts each record, so a malformed projection
  * throws here rather than silently storing junk.
  */
-export function extractItemFixtures({ store, version, runJson, snapshot, corpusInput, envelope, payload }) {
+export function extractItemFixtures({ store, version, runJson, snapshot, corpusInput, envelope, payload, maxVerifier }) {
   if (!envelope || envelope.status !== "ok") return { item_id: envelope?.item_id, skipped: true, reason: envelope?.status ?? "missing" };
   if (!payload) return { item_id: envelope.item_id, skipped: true, reason: "no-payload" };
   const ctx = itemContext({ store, version, runJson, snapshot, corpusInput, envelope });
-  const arts = buildStageArtifacts(payload, ctx);
+  let arts = buildStageArtifacts(payload, ctx);
+
+  // Cost cap: the verifier stage is O(findings) — one fixture per blocking finding —
+  // and each fixture is replayed K times, so a pathological capture (the #521 pilot
+  // raised 48) makes the replay explode. When maxVerifier is set, keep only the first
+  // N verifier fixtures by a STABLE key (instanceKey sort), so the subset is
+  // deterministic across extractions and the dropped count is reported, not silent.
+  let verifierDropped = 0;
+  if (maxVerifier > 0) {
+    const verifier = arts.filter((a) => a.stage === "verifier").sort((x, y) => stageInstanceKey(x).localeCompare(stageInstanceKey(y)));
+    if (verifier.length > maxVerifier) {
+      const keep = new Set(verifier.slice(0, maxVerifier).map(stageInstanceKey));
+      verifierDropped = verifier.length - maxVerifier;
+      arts = arts.filter((a) => a.stage !== "verifier" || keep.has(stageInstanceKey(a)));
+    }
+  }
+
   const byStage = { detection: 0, verifier: 0, gate: 0 };
   for (const art of arts) {
     store.putStageArtifact(version, stageInstanceKey(art), art);
     byStage[art.stage] = (byStage[art.stage] ?? 0) + 1;
   }
-  return { item_id: envelope.item_id, count: arts.length, byStage };
+  return { item_id: envelope.item_id, count: arts.length, byStage, verifierDropped };
 }
 
 /** Default fixture-corpus version — grouped by corpus + judge identity, so repeated
@@ -98,7 +114,8 @@ async function main() {
     : store.listRuns({ configHash: args["config-hash"], corpusVersion: args["corpus-version"] });
   if (runIds.length === 0) { console.error("no matching runs"); process.exit(1); }
 
-  const totals = { detection: 0, verifier: 0, gate: 0, items: 0, skipped: 0 };
+  const maxVerifier = Number(args["max-verifier-fixtures"] ?? 0) || 0;
+  const totals = { detection: 0, verifier: 0, gate: 0, items: 0, skipped: 0, verifierDropped: 0 };
   let version = args["stage-version"];
   for (const runId of runIds) {
     const run = store.getRun(runId);
@@ -112,15 +129,18 @@ async function main() {
       if (!corpusInput) { console.error(`  ! ${itemId}: no corpus input, skipping`); totals.skipped++; continue; }
       const r = extractItemFixtures({
         store, version, runJson, snapshot: configSnapshot, corpusInput,
-        envelope: got.envelope, payload: got.payload,
+        envelope: got.envelope, payload: got.payload, maxVerifier,
       });
       if (r.skipped) { totals.skipped++; process.stdout.write(`  = ${itemId}: skipped (${r.reason})\n`); continue; }
       totals.items++;
+      totals.verifierDropped += r.verifierDropped ?? 0;
       for (const s of ["detection", "verifier", "gate"]) totals[s] += r.byStage[s] ?? 0;
-      process.stdout.write(`  + ${itemId}: ${r.count} (det ${r.byStage.detection}, ver ${r.byStage.verifier}, gate ${r.byStage.gate})\n`);
+      const dropNote = r.verifierDropped ? ` [capped: dropped ${r.verifierDropped} verifier]` : "";
+      process.stdout.write(`  + ${itemId}: ${r.count} (det ${r.byStage.detection}, ver ${r.byStage.verifier}, gate ${r.byStage.gate})${dropNote}\n`);
     }
   }
-  console.log(`stage-fixtures "${version}": ${totals.items} item(s) → detection ${totals.detection}, verifier ${totals.verifier}, gate ${totals.gate}; skipped ${totals.skipped}`);
+  const capNote = maxVerifier ? ` (verifier capped at ${maxVerifier}/item; dropped ${totals.verifierDropped})` : "";
+  console.log(`stage-fixtures "${version}": ${totals.items} item(s) → detection ${totals.detection}, verifier ${totals.verifier}, gate ${totals.gate}; skipped ${totals.skipped}${capNote}`);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

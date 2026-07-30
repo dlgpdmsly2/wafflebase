@@ -74,6 +74,47 @@ test("extractItemFixtures: harvests det×2 + ver×1 + gate×1, all valid, blobs 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+// A payload whose correctness lens raises THREE blocking findings → 3 verifier
+// fixtures, so the cap has something to trim.
+function verMany(f) { return { population: "fresh", finding: f, verdict: { verdict: "confirmed", confidence: "low", reason: "x", refutationGround: "none", groundedIn: [] }, dropped: false }; }
+function payloadManyVerifier() {
+  const f1 = { severity: "major", confidence: "high", file: "a.ts", summary: "boom one", evidence: "e" };
+  const f2 = { severity: "major", confidence: "high", file: "b.ts", summary: "boom two", evidence: "e" };
+  const f3 = { severity: "major", confidence: "high", file: "c.ts", summary: "boom three", evidence: "e" };
+  return {
+    panel: [{ id: "correctness", title: "Correctness", blocking: true, applicable: true, conclusion: "failure", valid: true }],
+    findings: [f1, f2, f3].map((f) => ({ lens: "correctness", ...f })),
+    stageDetail: { correctness: { samples: [[f1, f2, f3], [f1, f2, f3]], verifications: [verMany(f1), verMany(f2), verMany(f3)] } },
+  };
+}
+
+test("extractItemFixtures: --max-verifier-fixtures caps deterministically, reports dropped", () => {
+  const snap1 = { config_hash: "sha256:cfg", lenses: [{ id: "correctness", title: "Correctness", model: "claude-opus-5", samples: 2, rubric_text: "RUB" }] };
+  const run = (maxVerifier) => {
+    const { store, root } = tmpStore();
+    try {
+      seed(store);
+      const corpusInput = store.getCorpusItemInput("pr-1");
+      const envelope = { item_id: "pr-1", status: "ok", timestamp: "2026-07-29T00:00:00.000Z" };
+      const r = extractItemFixtures({ store, version: "SV", runJson, snapshot: snap1, corpusInput, envelope, payload: payloadManyVerifier(), maxVerifier });
+      const keptKeys = store.listStageArtifacts("SV").filter((a) => a.stage === "verifier").map(stageInstanceKey).sort();
+      return { r, keptKeys };
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  };
+
+  const uncapped = run(0);
+  assert.equal(uncapped.r.byStage.verifier, 3);
+  assert.equal(uncapped.r.verifierDropped, 0);
+
+  const capped = run(2);
+  assert.equal(capped.r.byStage.verifier, 2);       // trimmed to the cap
+  assert.equal(capped.r.verifierDropped, 1);        // and the drop is reported
+  // deterministic subset: a second capped extraction keeps the SAME two fixtures
+  assert.deepEqual(run(2).keptKeys, capped.keptKeys);
+  // the kept keys are the stable-sort prefix of the uncapped set
+  assert.deepEqual(capped.keptKeys, uncapped.keptKeys.slice(0, 2));
+});
+
 test("extractItemFixtures: re-extraction is idempotent (write-once keys)", () => {
   const { store, root } = tmpStore();
   try {

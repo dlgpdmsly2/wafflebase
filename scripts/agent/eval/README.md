@@ -86,10 +86,14 @@ Runbook — one item, K=2 (only the capture is panel-scale):
 
 ```bash
 V=2026-07-28-pilot; SV="${V}__stagepilot"; PR=521
-# 1. capture ONE item (a real panel run → per-stage detail in the payload)
-node eval/run.mjs --out "$EVAL" --corpus-version "$V" --items "pr-$PR" --run-id stage-capture
-# 2. harvest frozen fixtures (offline, free)
-node eval/extract-stage-fixtures.mjs --out "$EVAL" --run-id stage-capture --stage-version "$SV"
+# 1. capture ONE item (a real panel run → per-stage detail in the payload).
+#    --require-repo-context ABORTS before spending if the repo tree can't be checked
+#    out at review_commit — a diff-only capture over-flags and explodes the verifier
+#    fan-out (the #521 pilot billed $44 this way). Omit only for a deliberate diff-only run.
+node eval/run.mjs --out "$EVAL" --corpus-version "$V" --items "pr-$PR" --run-id stage-capture --require-repo-context
+# 2. harvest frozen fixtures (offline, free). --max-verifier-fixtures caps the
+#    O(findings)×K verifier replay cost (0 = uncapped).
+node eval/extract-stage-fixtures.mjs --out "$EVAL" --run-id stage-capture --stage-version "$SV" --max-verifier-fixtures 8
 # 3. replay each stage K=2 times (verifier/detection need repo context: --repo-source)
 for k in 1 2; do for s in gate verifier detection; do
   node eval/stage-run.mjs --out "$EVAL" --stage-version "$SV" --stage "$s" --run-id "$s-$k" --repo-source ../../..
