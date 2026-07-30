@@ -179,6 +179,18 @@ export function aggregatePanelStats(entries) {
   // drop count WAS `refutedHighConfidence`, so a mixed-history PR shows the
   // grounded drops it can actually account for rather than an inflated total.
   let sentToVerifier = 0, refuted = 0, refutedHighConfidence = 0, dropped = 0;
+  // Absence claims ("there is no X"), which are refuted by finding ONE
+  // counterexample rather than by failing to find the code. Absent from entries
+  // written before the split existed, which coerce to 0.
+  let absenceRaised = 0, absenceRefuted = 0, unresolved = 0;
+  // Novelty gate. Absent from entries written before it existed, which coerce to
+  // 0 — an all-zero row reads as "the gate never fired", the honest reading for
+  // both a pre-instrumentation round and a round where it ran inert.
+  // `unknownOrigin` is the one that matters: it is how often git could not place
+  // a finding, so `backlog: 0` with a high `unknownOrigin` means the gate is
+  // blind (no --base-sha, a shallow clone, findings with no line) rather than
+  // that nothing was relocated.
+  let laneBlocking = 0, laneBacklog = 0, laneUnknownOrigin = 0;
   for (const e of list) {
     if (!e || typeof e !== "object") continue;
     if (Object.prototype.hasOwnProperty.call(agreementCounts, e.agreement)) agreementCounts[e.agreement]++;
@@ -193,10 +205,17 @@ export function aggregatePanelStats(entries) {
     refuted += Number(e.verifier && e.verifier.refuted) || 0;
     refutedHighConfidence += Number(e.verifier && e.verifier.refutedHighConfidence) || 0;
     dropped += Number(e.verifier && e.verifier.dropped) || 0;
+    absenceRaised += Number(e.verifier && e.verifier.absenceRaised) || 0;
+    absenceRefuted += Number(e.verifier && e.verifier.absenceRefuted) || 0;
+    unresolved += Number(e.verifier && e.verifier.unresolved) || 0;
+    laneBlocking += Number(e.lanes && e.lanes.blocking) || 0;
+    laneBacklog += Number(e.lanes && e.lanes.backlog) || 0;
+    laneUnknownOrigin += Number(e.lanes && e.lanes.unknownOrigin) || 0;
   }
   return {
     agreementCounts, raised, raisedConfidence, kept,
-    verifier: { sentToVerifier, refuted, refutedHighConfidence, dropped },
+    verifier: { sentToVerifier, refuted, refutedHighConfidence, dropped, absenceRaised, absenceRefuted, unresolved },
+    lanes: { blocking: laneBlocking, backlog: laneBacklog, unknownOrigin: laneUnknownOrigin },
   };
 }
 
@@ -351,6 +370,7 @@ export function renderSummary({ agg, panelAgg, panelStats, flips, scope }) {
     const rc = panelStats?.raisedConfidence || {};
     const k = panelStats?.kept || {};
     const v = panelStats?.verifier || {};
+    const l = panelStats?.lanes || {};
     const sampledRounds = (ac.identical || 0) + (ac.partial || 0) + (ac.disjoint || 0);
     lines.push(
       "",
@@ -382,11 +402,21 @@ export function renderSummary({ agg, panelAgg, panelStats, flips, scope }) {
       // the finding when it names a ground and cites what it read. The GAP is
       // the signal — it counts refutations the gate declined to act on.
       `- Refuted: ${v.refuted || 0} (${v.refutedHighConfidence || 0} high-confidence, ${v.dropped || 0} dropped)`,
+      // Absence claims are refuted by finding ONE counterexample, so a low
+      // refute rate here is not reassurance — it is the shape of a claim nobody
+      // could settle riding through as though it had been checked. `unresolved`
+      // is that case counted honestly; it still blocks.
+      `- Absence claims: ${v.absenceRaised || 0} raised, ${v.absenceRefuted || 0} refuted by counterexample, ${v.unresolved || 0} unresolved (still blocking)`,
       // All four severities shown (critical/major lead as the blocking ones)
       // so the raw counts reconcile with the weighted scalar below, which
       // weights every severity — mirrors the "Findings raised" pair above.
       `- Survived to gate: ${k.critical || 0} critical, ${k.major || 0} major, ${k.minor || 0} minor, ${k.nit || 0} nit`,
       `- Weighted survived-to-gate: ${weightSeverity(k)}`,
+      // Novelty gate. Read `unknownOrigin` FIRST: it counts blockers git could
+      // not place, so a zero `relocated` next to a high `unknownOrigin` means
+      // the gate ran blind (no --base-sha, a shallow clone, findings with no
+      // line), not that nothing was moved. Only `relocated` demotes.
+      `- Novelty gate: ${l.backlog || 0} relocated (demoted), ${l.blocking || 0} gating, ${l.unknownOrigin || 0} unplaceable`,
     );
     // Advisory heads-up (NOT a verdict): a lens that blocked then approved across
     // rounds — the PR #521 pattern. Can't distinguish a genuine fix from judge

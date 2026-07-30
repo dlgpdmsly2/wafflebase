@@ -86,7 +86,9 @@ export function buildStageArtifacts(captured, ctx) {
         provenance: { ...provBase, model: meta.model },
         input: {
           finding: v.finding, rubric, changed_files: refs.changed_files ?? null,
-          changed_context, repo_commit, model: meta.model, max_turns: VERIFIER_MAX_TURNS,
+          // VERIFIER_MAX_TURNS is now per claim-type ({presence, absence}); record the
+          // presence budget as the informational max (verifyFinding derives its own on replay).
+          changed_context, repo_commit, model: meta.model, max_turns: VERIFIER_MAX_TURNS.presence,
         },
         output: decided
           ? {
