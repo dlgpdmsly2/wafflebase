@@ -48,13 +48,30 @@ export function resolveBlobRef(store, version, ref) {
 /** The working tree the stage runs against: the repo checked out at `repo_commit`
  * (`materializeRepoAt`, cached), or a fresh EMPTY dir when unavailable — diff-only.
  * Detection tolerates an empty dir (it has the diff); the independent VERIFIER
- * Greps this tree, so diff-only starves it (a documented low-fidelity mode). */
-function resolveRepoDir({ repoSource, repoCache, repo_commit }) {
+ * Greps this tree, so diff-only starves it (a documented low-fidelity mode).
+ *
+ * Returns the DESCRIPTOR, not a bare path, so the caller can tell a deliberate
+ * diff-only replay from a degraded one. This used to hand back a path and nothing
+ * else: a fetch that failed silently produced an empty dir, and the replay billed
+ * full price for starved draws with no line in the log saying so — the same blind
+ * spot that let the #521 pilot spend $44 on a diff-only capture. `expected` is true
+ * whenever the caller ASKED for repo context (`--repo-source`), which is what makes
+ * `files === 0` a fault rather than a choice.
+ */
+export function resolveRepoDir({ repoSource, repoCache, repo_commit }) {
   const ctx = repoCache ? materializeRepoAt({ repoSource, commit: repo_commit, cacheRoot: repoCache }) : null;
-  if (ctx?.path) return ctx.path;
+  if (ctx?.path) return { dir: ctx.path, files: ctx.files, error: null, expected: true };
   const dir = path.join(mkdtempSync(path.join(tmpdir(), "stage-repo-")), "repo");
   mkdirSync(dir, { recursive: true });
-  return dir;
+  return {
+    dir,
+    files: 0,
+    error: ctx?.error
+      ?? (!repoSource ? null
+        : !repo_commit ? "fixture has no repo_commit (captured diff-only)"
+        : "no repo cache configured"),
+    expected: !!repoSource,
+  };
 }
 
 /**
@@ -102,12 +119,14 @@ export const detectionAdapter = {
 
   prepareInput(fixture, { store, version, repoSource = null, repoCache = null }) {
     const i = fixture.input;
+    const repoCtx = resolveRepoDir({ repoSource, repoCache, repo_commit: i.repo_commit });
     return {
       lens: { id: fixture.instance.lens_id, title: i.title, model: i.model, needsIssueSpec: i.needs_issue_spec },
       rubric: resolveBlobRef(store, version, i.rubric) ?? "",
       diff: resolveBlobRef(store, version, i.diff) ?? "",
       issue: resolveBlobRef(store, version, i.issue),
-      repo: resolveRepoDir({ repoSource, repoCache, repo_commit: i.repo_commit }),
+      repo: repoCtx.dir,
+      repoContext: repoCtx, // surfaced so stage-run can log/guard a degraded checkout
       samples: Math.max(1, Number(i.samples) || 2),
     };
   },
@@ -149,10 +168,12 @@ export const verifierAdapter = {
     const i = fixture.input;
     const cfText = resolveBlobRef(store, version, i.changed_files);
     const changedFiles = cfText ? cfText.split("\n").map((s) => s.trim()).filter(Boolean) : [];
+    const repoCtx = resolveRepoDir({ repoSource, repoCache, repo_commit: i.repo_commit });
     return {
       finding: i.finding,
       rubric: resolveBlobRef(store, version, i.rubric) ?? "",
-      repo: resolveRepoDir({ repoSource, repoCache, repo_commit: i.repo_commit }),
+      repo: repoCtx.dir,
+      repoContext: repoCtx, // this stage Greps the tree — an empty one silently guts it
       model: i.model,
       changedContext: changedFileContext(changedFiles),
     };

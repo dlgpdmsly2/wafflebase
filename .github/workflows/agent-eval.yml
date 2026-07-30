@@ -282,7 +282,14 @@ jobs:
           # Verifier/detection re-establish facts from the repo checked out at the
           # review commit; gate is pure and ignores --repo-source. Diff-only starves
           # the verifier's Grep (low-fidelity), so keep repo context on when you can.
-          [ "${{ inputs.no_repo_context }}" = "true" ] && REPO="" || REPO="--repo-source ${{ github.workspace }}"
+          #
+          # --require-repo-context mirrors the capture's guard: unless diff-only was
+          # asked for, a replay that cannot check out the tree ERRORS instead of
+          # quietly billing full price for starved input. It matters most on a
+          # RE-DISPATCH, where the capture is skipped as already-done and a cold
+          # runner may no longer have the PR commits fetched.
+          if [ "${{ inputs.no_repo_context }}" = "true" ]; then REPO="";
+          else REPO="--repo-source ${{ github.workspace }} --require-repo-context"; fi
           # DETECTION replay re-runs the entire 5-lens × N-sample panel — a full review
           # per K, the pilot's dominant cost (~$12/K). Off by default so a routine pilot
           # is capture + gate + verifier (cheap, predictable, low session-limit risk);

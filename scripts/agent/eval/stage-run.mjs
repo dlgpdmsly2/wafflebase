@@ -26,9 +26,9 @@ import { sumExecutions } from "../metrics.mjs";
  * is skipped. Returns a summary. An adapter/replay throw is recorded as an `error`
  * envelope (fail-visible), not dropped.
  */
-export async function runStage({ store, stageVersion, stage, runId, adapter, timestamp, repoSource = null, repoCache = null, env = process.env }) {
+export async function runStage({ store, stageVersion, stage, runId, adapter, timestamp, repoSource = null, repoCache = null, requireRepoContext = false, log = (s) => process.stdout.write(s), env = process.env }) {
   const fixtures = store.listStageArtifacts(stageVersion).filter((a) => a && a.stage === stage);
-  const summary = { stage, run_id: runId, stage_version: stageVersion, total: fixtures.length, ok: 0, error: 0, skipped: 0, cost_usd: 0 };
+  const summary = { stage, run_id: runId, stage_version: stageVersion, total: fixtures.length, ok: 0, error: 0, skipped: 0, degraded: 0, cost_usd: 0 };
 
   for (const fixture of fixtures) {
     const fixtureRef = stageInstanceKey(fixture);
@@ -38,6 +38,28 @@ export async function runStage({ store, stageVersion, stage, runId, adapter, tim
     let envelope;
     try {
       const prepared = await adapter.prepareInput(fixture, { store, version: stageVersion, repoSource, repoCache });
+
+      // Repo context, reported per fixture the way run.mjs reports it per item. A
+      // starved checkout changes what detection sees and guts what the verifier can
+      // Grep, so it must never be inferable only from a suspiciously cheap bill.
+      // (gate is pure and exposes no repoContext, so this is a no-op there.)
+      const rc = prepared?.repoContext;
+      if (rc?.expected) {
+        log(`  → ${fixtureRef}: repo context = ${rc.files ? `${rc.files} files` : `DIFF-ONLY (unavailable${rc.error ? `: ${rc.error}` : ""})`}\n`);
+      }
+      // Same fail-before-spending rule the capture gets via run.mjs's flag: refuse a
+      // replay that would silently bill full price for degraded input.
+      if (requireRepoContext && rc?.expected && rc.files === 0) {
+        const msg = `repo context required but unavailable${rc.error ? `: ${rc.error}` : ""}`;
+        store.putStageRun(stageVersion, runId, fixtureRef, {
+          ...stub, status: "error", reason: "no-repo-context", cost_usd: 0, weighted_tokens: 0,
+          raw_tokens: 0, duration_ms: 0, turns: 0, calls: 0, output: null,
+          error: { message: msg, kind: "no-repo-context" },
+        });
+        summary.error++; summary.degraded++;
+        continue;
+      }
+
       const { output, sessionLog } = await adapter.runReplica(prepared, { env });
       const c = sumExecutions(sessionLog ?? [], "review");
       envelope = { ...stub, status: "ok", reason: null, cost_usd: c.costUsd, weighted_tokens: c.weightedTokens, raw_tokens: c.tokens, duration_ms: c.durationMs, turns: c.turns, calls: c.calls, output, error: null };
@@ -62,7 +84,7 @@ async function main() {
     if (process.argv[i].startsWith("--")) { const n = process.argv[i + 1]; if (n === undefined || n.startsWith("--")) args[process.argv[i].slice(2)] = true; else { args[process.argv[i].slice(2)] = n; i++; } }
   }
   if (!args.out || !args["stage-version"] || !args.stage) {
-    console.error("usage: stage-run.mjs --out <repo> --stage-version <v> --stage <gate|detection|verifier> [--run-id <id>] [--repo-source <dir>] [--no-repo-context]");
+    console.error("usage: stage-run.mjs --out <repo> --stage-version <v> --stage <gate|detection|verifier> [--run-id <id>] [--repo-source <dir>] [--no-repo-context] [--require-repo-context]");
     process.exit(2);
   }
   const adapter = STAGE_ADAPTERS[args.stage];
@@ -76,8 +98,14 @@ async function main() {
   const repoSource = args["no-repo-context"] ? null : (args["repo-source"] ? path.resolve(args["repo-source"]) : null);
   const repoCache = path.join(tmpdir(), "eval-repo-cache");
 
-  const s = await runStage({ store, stageVersion, stage: args.stage, runId, adapter, timestamp: nowIso(), repoSource, repoCache, env: process.env });
-  console.log(`stage-run ${runId}: stage=${s.stage} total=${s.total} ok=${s.ok} error=${s.error} skipped=${s.skipped} cost=$${(s.cost_usd || 0).toFixed(2)}`);
+  const s = await runStage({
+    store, stageVersion, stage: args.stage, runId, adapter, timestamp: nowIso(),
+    repoSource, repoCache, requireRepoContext: !!args["require-repo-context"], env: process.env,
+  });
+  console.log(
+    `stage-run ${runId}: stage=${s.stage} total=${s.total} ok=${s.ok} error=${s.error} ` +
+    `skipped=${s.skipped}${s.degraded ? ` no-repo-context=${s.degraded}` : ""} cost=$${(s.cost_usd || 0).toFixed(2)}`,
+  );
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

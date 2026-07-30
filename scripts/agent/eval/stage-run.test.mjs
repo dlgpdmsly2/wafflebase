@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { GitFsStore } from "./store.mjs";
-import { gateAdapter, detectionAdapter, verifierAdapter, resolveBlobRef, STAGE_ADAPTERS } from "./stage-adapters.mjs";
+import { gateAdapter, detectionAdapter, verifierAdapter, resolveBlobRef, resolveRepoDir, STAGE_ADAPTERS } from "./stage-adapters.mjs";
 import { runStage } from "./stage-run.mjs";
 import { validateStageArtifact, stageInstanceKey } from "./stage-artifacts.mjs";
 
@@ -177,5 +177,122 @@ test("verifierAdapter.prepareInput: recomputes trust context from the frozen cha
     assert.equal(p.changedContext.authoritative, true); // 2 clean files → authoritative
     assert.equal(p.changedContext.total, 2);
     assert.equal(typeof p.repo, "string");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// --- repo context: visible, and refusable ------------------------------------
+// A starved checkout changes what detection sees and guts what the verifier can
+// Grep. It used to be inferable only from a suspiciously cheap bill.
+
+test("resolveRepoDir: no --repo-source is a deliberate diff-only run, not a fault", () => {
+  const r = resolveRepoDir({ repoSource: null, repoCache: null, repo_commit: "abc123" });
+  assert.equal(r.expected, false);   // nobody asked for context
+  assert.equal(r.files, 0);
+  assert.equal(r.error, null);
+  assert.ok(r.dir);                  // still a usable empty dir
+});
+
+test("resolveRepoDir: context asked for but unresolvable → expected with a reason", () => {
+  const r = resolveRepoDir({ repoSource: "/nonexistent/repo", repoCache: null, repo_commit: "deadbeef" });
+  assert.equal(r.expected, true);
+  assert.equal(r.files, 0);
+  assert.match(r.error, /repo cache|no repo/i);
+});
+
+test("resolveRepoDir: a fixture captured diff-only says so", () => {
+  const r = resolveRepoDir({ repoSource: "/some/repo", repoCache: "/some/cache", repo_commit: null });
+  assert.equal(r.expected, true);
+  assert.match(r.error, /no repo_commit/);
+});
+
+/** Adapter that reports whatever repo context the test wants, and records whether
+ * it was actually asked to spend. */
+const fakeAdapter = (repoContext) => {
+  const calls = { replicas: 0 };
+  return {
+    calls,
+    stage_id: "gate",
+    prepareInput: () => ({ repoContext }),
+    runReplica: async () => { calls.replicas++; return { output: { per_lens: [], verdict: "approve" }, sessionLog: [] }; },
+  };
+};
+
+test("runStage: logs the per-fixture repo-context line, file count and all", async () => {
+  const { store, root } = tmpStore();
+  try {
+    store.putStageArtifact("SV", stageInstanceKey(blockFx), blockFx);
+    const lines = [];
+    await runStage({
+      store, stageVersion: "SV", stage: "gate", runId: "SR1", timestamp: "T0",
+      adapter: fakeAdapter({ dir: "/x", files: 1234, error: null, expected: true }),
+      log: (s) => lines.push(s),
+    });
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /repo context = 1234 files/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("runStage: a degraded checkout is announced as DIFF-ONLY with the reason", async () => {
+  const { store, root } = tmpStore();
+  try {
+    store.putStageArtifact("SV", stageInstanceKey(blockFx), blockFx);
+    const lines = [];
+    const a = fakeAdapter({ dir: "/x", files: 0, error: "fatal: not a valid object name", expected: true });
+    const s = await runStage({
+      store, stageVersion: "SV", stage: "gate", runId: "SR1", timestamp: "T0", adapter: a,
+      log: (l) => lines.push(l),
+    });
+    assert.match(lines[0], /DIFF-ONLY \(unavailable: fatal: not a valid object name\)/);
+    // Without the guard, behaviour is unchanged: it still runs (and still spends).
+    assert.equal(a.calls.replicas, 1);
+    assert.equal(s.ok, 1);
+    assert.equal(s.degraded, 0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("runStage: --require-repo-context refuses to spend on a starved checkout", async () => {
+  const { store, root } = tmpStore();
+  try {
+    store.putStageArtifact("SV", stageInstanceKey(blockFx), blockFx);
+    const a = fakeAdapter({ dir: "/x", files: 0, error: "commit not fetched", expected: true });
+    const s = await runStage({
+      store, stageVersion: "SV", stage: "gate", runId: "SR1", timestamp: "T0", adapter: a,
+      requireRepoContext: true, log: () => {},
+    });
+    assert.equal(a.calls.replicas, 0);        // the whole point: never billed
+    assert.equal(s.ok, 0);
+    assert.equal(s.error, 1);
+    assert.equal(s.degraded, 1);
+    const env = store.getStageRun("SV", "SR1", stageInstanceKey(blockFx));
+    assert.equal(env.status, "error");
+    assert.equal(env.reason, "no-repo-context");
+    assert.equal(env.error.kind, "no-repo-context");
+    assert.equal(env.cost_usd, 0);
+    assert.match(env.error.message, /commit not fetched/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("runStage: the guard ignores a deliberate diff-only run and the pure gate", async () => {
+  const { store, root } = tmpStore();
+  try {
+    store.putStageArtifact("SV", stageInstanceKey(blockFx), blockFx);
+    // expected:false — the operator chose --no-repo-context; nothing to refuse.
+    const a = fakeAdapter({ dir: "/x", files: 0, error: null, expected: false });
+    const lines = [];
+    const s = await runStage({
+      store, stageVersion: "SV", stage: "gate", runId: "SR1", timestamp: "T0", adapter: a,
+      requireRepoContext: true, log: (l) => lines.push(l),
+    });
+    assert.equal(a.calls.replicas, 1);
+    assert.equal(s.ok, 1);
+    assert.deepEqual(lines, []);   // no context asked for → no noise
+
+    // the real gate adapter exposes no repoContext at all → guard is a no-op
+    const g = await runStage({
+      store, stageVersion: "SV", stage: "gate", runId: "SR2", timestamp: "T0",
+      adapter: gateAdapter, requireRepoContext: true, log: () => {},
+    });
+    assert.equal(g.ok, 1);
+    assert.equal(g.degraded, 0);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
