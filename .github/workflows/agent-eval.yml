@@ -16,6 +16,11 @@
 #                  PR commits aren't fetchable in the fork CI it falls back to
 #                  diff-only, which makes the verifier metric low-fidelity — see the
 #                  no_repo_context note.
+#                  With stage_detection_only it narrows to DETECTION alone and adds
+#                  the sample-count study — "is the 2nd detection sample worth its
+#                  cost?" — scored by sample-count-analysis.mjs. Each replay at
+#                  samples:2 yields TWO independent single-sample draws, so K
+#                  replicates give 2K draws to resample the curve from.
 #   validity     — VALIDITY (is the panel right?), the counterpart to reliability's
 #                  (is it stable?). Lightweight + MODEL-FREE: no extract, no panel
 #                  run, no capture — it only re-scores stage fixtures a prior
@@ -67,6 +72,9 @@ on:
       stage_include_detection:
         description: "stage-pilot only: also replay DETECTION (re-runs the FULL 5-lens panel per K — the pilot's biggest cost, ~$12/K). false = gate+verifier only (cheap, session-safe)"
         default: "false"
+      stage_detection_only:
+        description: "stage-pilot only: replay ONLY detection and score the sample-count study (skips gate+verifier entirely). Overrides stage_include_detection. Use K>=3"
+        default: "false"
       no_repo_context:
         description: "true = diff-only replay (skip repo checkout)"
         default: "false"
@@ -76,7 +84,11 @@ on:
 
 jobs:
   eval:
-    if: ${{ inputs.mode != 'stage-pilot' }}
+    # Match `reliability` EXPLICITLY, not "anything that isn't stage-pilot". With a
+    # third mode in play, the old negative guard let `mode: validity` start this job
+    # too — a whole-panel run charging real model budget behind a mode documented as
+    # costing $0. A mistyped mode now runs nothing, which is the safe failure.
+    if: ${{ inputs.mode == 'reliability' }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
@@ -276,7 +288,14 @@ jobs:
           # is capture + gate + verifier (cheap, predictable, low session-limit risk);
           # opt in only when you specifically want detection reliability. gate is free
           # (pure) and verifier is capped, so those always run.
-          if [ "${{ inputs.stage_include_detection }}" = "true" ]; then STAGES="gate verifier detection"; else STAGES="gate verifier"; fi
+          #
+          # stage_detection_only narrows that to detection ALONE — the sample-count
+          # study (is the 2nd sample worth its cost?) reads nothing but per-sample
+          # detection output, so replaying gate and verifier K times would be pure
+          # spend against metrics nobody reads on that dispatch.
+          if [ "${{ inputs.stage_detection_only }}" = "true" ]; then STAGES="detection";
+          elif [ "${{ inputs.stage_include_detection }}" = "true" ]; then STAGES="gate verifier detection";
+          else STAGES="gate verifier"; fi
           echo "replaying stages: $STAGES (K=${{ inputs.stage_k }})"
           for k in $(seq 1 "${{ inputs.stage_k }}"); do
             for stage in $STAGES; do
@@ -291,13 +310,27 @@ jobs:
         working-directory: scripts/agent
         run: |
           # Score only the stages actually replayed (detection is opt-in above).
-          if [ "${{ inputs.stage_include_detection }}" = "true" ]; then STAGES="gate verifier detection"; else STAGES="gate verifier"; fi
+          if [ "${{ inputs.stage_detection_only }}" = "true" ]; then STAGES="detection";
+          elif [ "${{ inputs.stage_include_detection }}" = "true" ]; then STAGES="gate verifier detection";
+          else STAGES="gate verifier"; fi
           for stage in $STAGES; do
             echo "::group::score $stage"
             node eval/stage-reliability.mjs --out "$RESULTS_DIR" --stage-version "$SV" --stage "$stage" \
               || echo "  (need ≥2 usable replicates for $stage — skipped)"
             echo "::endgroup::"
           done
+          # Sample-count study — only meaningful once detection was actually replayed.
+          # Model-free: it re-reads the per-sample findings those replays already wrote.
+          # NOTE its detection overlap sibling above (stage-reliability) keys findings on
+          # an EXACT `file::summary` string, so its mean_jaccard reads low whenever one
+          # defect is reworded; this scorer matches semantically and is the one to trust
+          # on detection agreement.
+          case " $STAGES " in *" detection "*)
+            echo "::group::score sample-count"
+            node eval/sample-count-analysis.mjs --out "$RESULTS_DIR" --stage-version "$SV" \
+              || echo "  (no usable detection replays — skipped)"
+            echo "::endgroup::" ;;
+          esac
 
       - name: Drop raw transcripts (bulky; verdicts live in payload.json)
         run: find "$RESULTS_DIR/runs" -name 'transcript.json.gz' -delete || true

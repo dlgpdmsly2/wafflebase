@@ -11,6 +11,11 @@ Built behind a **Target Adapter seam**: the framework runner is role-agnostic;
 the review panel is one adapter. A code-fixer or end-to-end target is a new
 adapter, not a harness rewrite.
 
+> **New here, or just want to know what this can answer?** Start with
+> [`capabilities.md`](capabilities.md) — every question the harness answers today,
+> what each costs, which dispatch inputs to use, and the limits to read before
+> quoting a number. This README is the architecture and the local runbooks.
+
 ## Modules
 
 | File | Role | Model calls? |
