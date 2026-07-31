@@ -143,3 +143,68 @@ test("joinVerifierRecords: end-to-end store join reproduces the #521 false-negat
     assert.equal(r.overall.effectiveness, "net-harmful");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("joinVerifierRecords: V2 matcher joins a REWORDED label that exact-key misses", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "verifier-validity-v2-"));
+  try {
+    const store = new GitFsStore(root);
+    const CV = "cv1";
+    // A label written against a DIFFERENT wording of the same defect (the pr-521
+    // seed situation: historical product-panel phrasing vs a fresh capture).
+    const labelKey = findingKey({
+      file: "packages/sheets/src/formula/arguments.ts",
+      summary: "blank-skip makes MIN/MAX over an all-blank range return #NUM! instead of 0",
+    });
+    store.putFindingLabel(CV, "pr-521", labelKey, { is_real: true, severity: "major", kind: "correctness" });
+
+    // The captured artifact says the same thing in other words → different key.
+    const art = {
+      schema_version: "stage-artifacts/v1", stage: "verifier", item_id: "pr-521",
+      instance: {
+        lens_id: "correctness", population: "fresh",
+        finding_key: "packages/sheets/src/formula/arguments.ts::blank-cell skipping in `arguments.iterate` makes min and max over an all-blank range return #num!",
+      },
+      input: { finding: {
+        file: "packages/sheets/src/formula/arguments.ts",
+        summary: "Blank-cell skipping in `Arguments.iterate` makes MIN and MAX over an all-blank range return #NUM!",
+        evidence: "`Arguments.iterate` skips blanks so MIN/MAX see an empty set",
+      } },
+      output: { decision: { verdict: "confirmed" }, error: null, dropped: false },
+    };
+
+    // exact-key only → no join (the documented 0/6 failure)
+    const exactOnly = joinVerifierRecords(store, CV, [art], { matcher: false });
+    assert.equal(exactOnly[0].is_real, null);
+    assert.equal(exactOnly[0].join_method, "none");
+
+    // with the matcher → joins, and records how
+    const withMatcher = joinVerifierRecords(store, CV, [art]);
+    assert.equal(withMatcher[0].is_real, true);
+    assert.equal(withMatcher[0].join_method, "matcher");
+    assert.equal(withMatcher[0].matched_label_key, labelKey);
+    assert.ok(withMatcher[0].match_score > 0.5);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("joinVerifierRecords: exact key stays the fast path and an unrelated finding never joins", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "verifier-validity-v2b-"));
+  try {
+    const store = new GitFsStore(root);
+    const CV = "cv1";
+    const key = findingKey({ file: "a.ts", summary: "exact wording" });
+    store.putFindingLabel(CV, "pr-1", key, { is_real: true });
+
+    const exactArt = vArt({ item_id: "pr-1", finding_key: key, dropped: false });
+    assert.equal(joinVerifierRecords(store, CV, [exactArt])[0].join_method, "exact");
+
+    // A finding about a different file with no shared symbols/location → no join,
+    // not even a maybe: the matcher must never invent ground truth.
+    const unrelated = {
+      ...vArt({ item_id: "pr-1", finding_key: "zzz/other.ts::a totally different rendering problem", dropped: false }),
+      input: { finding: { file: "zzz/other.ts", summary: "a totally different rendering problem", evidence: "" } },
+    };
+    const r = joinVerifierRecords(store, CV, [unrelated])[0];
+    assert.equal(r.is_real, null);
+    assert.equal(r.join_method, "none");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

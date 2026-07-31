@@ -25,6 +25,7 @@
 
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { bestMatch, labelToFinding, artifactToFinding } from "./finding-matcher.mjs";
 
 /**
  * The keep/drop decision a verifier artifact recorded, or null to EXCLUDE it:
@@ -158,20 +159,60 @@ export function computeVerifierValidity(records) {
 
 /**
  * Join verifier artifacts to finding labels via the store. `artifacts` = verifier
- * stage artifacts (instance.finding_key addresses the label). Returns the record
- * list computeVerifierValidity consumes.
+ * stage artifacts (instance.finding_key addresses the label).
+ *
+ * Two-tier join (V2): exact `finding_key` equality is the FAST PATH — always right
+ * within one run, since the label and the artifact carry the panel's own key. When
+ * it misses (a label written against a different run's wording — the pr-521 seed
+ * matched 0/6 captured keys this way), fall back to the V2 matcher over that item's
+ * labels: same defect, different words. Only a `match` verdict joins; a `maybe` is
+ * left UNJOINED and surfaced in `maybe_matches` for human adjudication, because a
+ * false join fabricates ground truth (the more dangerous error).
+ *
+ * `opts.matcher: false` restores exact-key-only behaviour.
  */
-export function joinVerifierRecords(store, corpusVersion, artifacts) {
+export function joinVerifierRecords(store, corpusVersion, artifacts, opts = {}) {
+  const useMatcher = opts.matcher !== false;
+  const labelsByItem = new Map(); // item_id → labels (listed once per item)
+  const labelsFor = (itemId) => {
+    if (!labelsByItem.has(itemId)) labelsByItem.set(itemId, store.listFindingLabels(corpusVersion, itemId) ?? []);
+    return labelsByItem.get(itemId);
+  };
+
   return (artifacts || [])
     .filter((a) => a && a.stage === "verifier")
     .map((a) => {
-      const label = store.getFindingLabel(corpusVersion, a.item_id, a.instance?.finding_key);
-      return {
+      const key = a.instance?.finding_key;
+      const base = {
         item_id: a.item_id,
-        finding_key: a.instance?.finding_key,
+        finding_key: key,
         population: a.instance?.population,
         decision: verifierDecision(a),
-        is_real: label && typeof label.is_real === "boolean" ? label.is_real : null,
+      };
+
+      const exact = store.getFindingLabel(corpusVersion, a.item_id, key);
+      if (exact && typeof exact.is_real === "boolean") {
+        return { ...base, is_real: exact.is_real, join_method: "exact" };
+      }
+      if (!useMatcher) return { ...base, is_real: null, join_method: "none" };
+
+      // Fuzzy fallback — compare the artifact's finding against this item's labels.
+      const labels = labelsFor(a.item_id).filter((l) => typeof l?.is_real === "boolean");
+      if (labels.length === 0) return { ...base, is_real: null, join_method: "none" };
+      const needle = artifactToFinding(a);
+      const best = bestMatch(needle, labels.map(labelToFinding), { crossSource: true });
+      if (!best) return { ...base, is_real: null, join_method: "none" };
+      const label = labels[best.index];
+      if (best.result.verdict === "match") {
+        return {
+          ...base, is_real: label.is_real, join_method: "matcher",
+          matched_label_key: label.finding_key, match_score: best.result.score, match_reason: best.result.reason,
+        };
+      }
+      // plausible but unconfirmed — do NOT join; hand it to the adjudication queue.
+      return {
+        ...base, is_real: null, join_method: "maybe",
+        maybe_matches: [{ label_key: label.finding_key, score: best.result.score, reason: best.result.reason }],
       };
     });
 }
