@@ -9,10 +9,12 @@
 //   real defect   keep_real (good)      drop_real  (killed a real bug — the #521 cell)
 //   hallucination keep_fake (junk→gate) drop_fake  (good)
 //
-// From it, the "is the verifier effective" bracket (overview §2.3): precision of the
-// findings REACHING the verifier (input) vs the KEPT set (output). Effective ⟺
-// precision lifts while recall barely falls; net-harmful ⟺ it lifts little AND drops
-// real bugs. Sliced by instance.population (fresh vs prior-round) — the #521 axis.
+// The verdict reads on two orthogonal, base-rate-independent axes: keep_recall (did
+// it preserve real defects — the HARM axis) and drop_specificity (did it drop the
+// junk it saw — the VALUE axis). precision_lift (kept-set vs input-set precision,
+// overview §2.3) is a base-rate-confounded summary, used only as a sign check —
+// judging on it alone lets a rubber stamp read "effective". Sliced by
+// instance.population (fresh vs prior-round) — the #521 axis.
 //
 // Truth needs the finding-level labels (store.getFindingLabel). Errored/unlabeled
 // verifier decisions are EXCLUDED, never laundered into the matrix (same discipline
@@ -72,17 +74,52 @@ export function metricsFromMatrix(m) {
   };
 }
 
-/** Qualitative read of the bracket (thresholds are deliberate + documented, not tuned). */
+// Verdict thresholds — POLICY knobs, deliberate not tuned-to-data. A reviewer may
+// tighten these; they are named so the choice is visible, not buried in comparisons.
+const RECALL_SAFE = 0.8;   // keep_recall ≥ this ⟹ the verifier preserved (nearly) all real defects it saw
+const RECALL_HARM = 0.5;   // keep_recall < this ⟹ it killed most real defects → harmful regardless of precision
+const SPEC_CLEANS = 0.5;   // drop_specificity ≥ this ⟹ it drops the MAJORITY of junk it saw (earns its keep)
+
+/**
+ * Qualitative read on TWO orthogonal, base-rate-independent axes — not on
+ * precision_lift alone, which moves with the input base rate and so rewards a
+ * rubber stamp when junk happens to be plentiful:
+ *   - harm axis   = keep_recall      (did it preserve the real defects it saw?)
+ *   - value axis  = drop_specificity (did it drop the hallucinations it saw?)
+ * precision_lift is used only as a sign check (a verifier facing junk that fails
+ * to clean the set is useless). Verdicts:
+ *   no-data | insufficient | net-harmful | mixed | rubber-stamp | effective
+ * `rubber-stamp` (safe recall but sub-majority specificity) is the #521 box: it
+ * keeps the real defects yet waves most junk through — weak, not "effective".
+ */
 export function effectiveness(m) {
   if (m.n === 0) return "no-data";
-  // Killing most of the real defects it saw is harmful regardless of kept-set
-  // precision — check recall before the precision_lift null-guard (kept-nothing).
-  if (m.keep_recall != null && m.keep_recall < 0.5) return "net-harmful";
-  if (m.precision_lift == null) return "insufficient"; // kept nothing / nothing reached it, and recall not damning
-  const recallOk = m.keep_recall == null || m.keep_recall >= 0.8;
-  if (m.precision_lift > 0 && recallOk) return "effective";
-  if (m.precision_lift <= 0) return "net-harmful";
-  return "mixed";
+
+  // Harm axis first — killing most real defects it saw is harmful no matter how
+  // clean the kept set looks. Checked before the precision_lift null-guard so a
+  // verifier that kept nothing can still be damned by its recall.
+  if (m.keep_recall != null && m.keep_recall < RECALL_HARM) return "net-harmful";
+  const recallSafe = m.keep_recall == null || m.keep_recall >= RECALL_SAFE;
+  const recallSoft = m.keep_recall != null && m.keep_recall >= RECALL_HARM && m.keep_recall < RECALL_SAFE;
+
+  // Kept nothing / nothing reached it, and recall isn't damning → nothing to judge.
+  if (m.precision_lift == null) return "insufficient";
+
+  // Value axis — of the hallucinations it saw, did it drop them? null = none
+  // reached it (it was never tested on junk); ≥ floor = cleans; below = rubber stamp.
+  const spec = m.drop_specificity;
+  const noJunkSeen = spec == null;
+  const cleansJunk = spec != null && spec >= SPEC_CLEANS;
+
+  // Junk DID reach it but the kept set is no cleaner (or dirtier) than the input → useless.
+  if (!noJunkSeen && m.precision_lift <= 0) return "net-harmful";
+
+  if (recallSoft) return "mixed";          // safe-ish, but still killed some real defects
+
+  // recallSafe from here on.
+  if (noJunkSeen) return "insufficient";   // kept the reals, but never faced a hallucination to drop
+  if (cleansJunk) return "effective";      // keeps the reals AND drops the majority of junk it saw
+  return "rubber-stamp";                    // keeps the reals but waves most junk through (the #521 shape)
 }
 
 function tally(records) {

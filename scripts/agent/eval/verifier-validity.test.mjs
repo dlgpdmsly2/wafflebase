@@ -54,10 +54,37 @@ test("metricsFromMatrix: worked example + null on empty denominators", () => {
 });
 
 test("effectiveness: effective / net-harmful / mixed / no-data", () => {
-  assert.equal(effectiveness(metricsFromMatrix({ keep_real: 5, keep_fake: 1, drop_real: 0, drop_fake: 4 })), "effective");   // lift>0, recall 1
+  assert.equal(effectiveness(metricsFromMatrix({ keep_real: 5, keep_fake: 1, drop_real: 0, drop_fake: 4 })), "effective");   // recall 1, spec 0.8
   assert.equal(effectiveness(metricsFromMatrix({ keep_real: 2, keep_fake: 3, drop_real: 2, drop_fake: 0 })), "net-harmful"); // lift<0
-  assert.equal(effectiveness(metricsFromMatrix({ keep_real: 3, keep_fake: 1, drop_real: 1, drop_fake: 5 })), "mixed");       // lift>0 but recall 0.75<0.8
+  assert.equal(effectiveness(metricsFromMatrix({ keep_real: 3, keep_fake: 1, drop_real: 1, drop_fake: 5 })), "mixed");       // recall 0.75<0.8
   assert.equal(effectiveness(metricsFromMatrix({ keep_real: 0, keep_fake: 0, drop_real: 0, drop_fake: 0 })), "no-data");
+});
+
+test("effectiveness: a rubber stamp (safe recall, sub-majority specificity) is NOT effective — the #521 shape", () => {
+  // The real pilot cell: n=6, kept 3/3 reals (recall 1.0) but only dropped 1 of 3
+  // fakes (spec 0.33). precision_lift is a positive +0.10, which the old scheme read
+  // as "effective". The value axis catches it: it waves the majority of junk through.
+  const m = metricsFromMatrix({ keep_real: 3, keep_fake: 2, drop_real: 0, drop_fake: 1 });
+  approx(m.keep_recall, 1);          // preserved every real defect it saw → safe
+  approx(m.drop_specificity, 1 / 3); // dropped only 1 of 3 hallucinations → sub-majority
+  assert.ok(m.precision_lift > 0);   // +0.10 — positive, yet not enough to earn "effective"
+  assert.equal(effectiveness(m), "rubber-stamp");
+});
+
+test("effectiveness: safe recall but never faced junk → insufficient, not net-harmful", () => {
+  // Only real findings reached it and it kept them: recall 1, specificity null,
+  // precision_lift 0 (kept set == input set). It did no harm but proved no value.
+  const m = metricsFromMatrix({ keep_real: 4, keep_fake: 0, drop_real: 0, drop_fake: 0 });
+  assert.equal(m.drop_specificity, null);
+  assert.equal(m.precision_lift, 0);
+  assert.equal(effectiveness(m), "insufficient");
+});
+
+test("effectiveness: keeps reals AND drops a majority of junk → effective", () => {
+  // spec exactly at the 0.5 floor (drops 1 of 2 fakes), recall 1 → clears the bar.
+  const m = metricsFromMatrix({ keep_real: 3, keep_fake: 1, drop_real: 0, drop_fake: 1 });
+  approx(m.drop_specificity, 0.5);
+  assert.equal(effectiveness(m), "effective");
 });
 
 test("computeVerifierValidity: matrix, population slice, exclusion discipline", () => {
