@@ -1,0 +1,99 @@
+# Round 2 — bisect to the single file whose presence the deserialize failure needs.
+#
+# Round 1 (n=60 per arm) settled two things:
+#   A  eval/run.test.mjs alone                 0 / 60
+#   B  reviewer.test.mjs + run.test.mjs        0 / 60   <- panel machinery ELIMINATED
+#   C  everything except reviewer + run        6 / 60   <- full rate, so the trigger
+#                                                          is among those 56 files
+#
+# This halves those 56 automatically. Each round probes the first half; if that
+# reproduces it recurses there, otherwise it probes the second half and recurses
+# there. If NEITHER half reproduces, the trigger needs files from both and the run
+# says so instead of guessing.
+#
+# n=40 per probe: at the ~10% rate a zero happens 1.5% of the time by chance, so a
+# wrong turn is unlikely but not impossible — about 1 in 12 across six rounds. The
+# log prints every decision so a suspicious one can be re-probed by hand.
+#
+# Expect roughly 25-40 minutes, unattended. It prints FINAL at the end.
+name: deser-bisect2
+
+on:
+  push:
+    branches: ["repro/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  bisect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+          cache: "pnpm"
+      - name: Install Dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Bisect
+        working-directory: scripts/agent
+        run: |
+          ISOLATED="eval/run.test.mjs"
+          EXCLUDE="eval/adapters/reviewer.test.mjs"
+          N=40
+
+          mapfile -t CAND < <(find . -type d -name node_modules -prune -o -name '*.test.mjs' -print \
+                              | cut -c3- | grep -v "^${ISOLATED}$" | grep -v "^${EXCLUDE}$" | sort)
+          echo "starting with ${#CAND[@]} candidate files, n=$N per probe"
+
+          # Hits for one candidate set, always accompanied by the isolated file.
+          # Progress goes to stderr so the caller can capture just the number.
+          probe() {
+            local hits=0 out
+            for _ in $(seq 1 "$N"); do
+              out="$(timeout -k 10 300 node --test-timeout=60000 --test "$@" "$ISOLATED" 2>&1 || true)"
+              if printf '%s' "$out" | grep -q 'Unable to deserialize cloned data'; then
+                hits=$((hits + 1))
+              fi
+            done
+            echo "$hits"
+          }
+
+          round=0
+          while [ "${#CAND[@]}" -gt 1 ]; do
+            round=$((round + 1))
+            mid=$(( ${#CAND[@]} / 2 ))
+            FIRST=("${CAND[@]:0:mid}")
+            SECOND=("${CAND[@]:mid}")
+            echo "--- round $round: ${#CAND[@]} candidates -> halves of ${#FIRST[@]} and ${#SECOND[@]}"
+
+            ha="$(probe "${FIRST[@]}")"
+            echo "    first half:  $ha/$N"
+            if [ "$ha" -gt 0 ]; then
+              CAND=("${FIRST[@]}")
+              continue
+            fi
+
+            hb="$(probe "${SECOND[@]}")"
+            echo "    second half: $hb/$N"
+            if [ "$hb" -gt 0 ]; then
+              CAND=("${SECOND[@]}")
+              continue
+            fi
+
+            echo "STOP: neither half reproduces on its own."
+            echo "  The trigger needs files from BOTH halves — it is not a single file."
+            echo "  Surviving set (${#CAND[@]} files):"
+            printf '    %s\n' "${CAND[@]}"
+            exit 0
+          done
+
+          echo "FINAL: ${CAND[*]}"
+          echo "Confirming it at n=$N, and confirming the isolated file alone is still clean..."
+          conf="$(probe "${CAND[@]}")"
+          alone="$(probe)"
+          echo "CONFIRM with_candidate=$conf/$N  isolated_alone=$alone/$N"
+          echo "  (a real answer looks like with_candidate > 0 and isolated_alone = 0)"
